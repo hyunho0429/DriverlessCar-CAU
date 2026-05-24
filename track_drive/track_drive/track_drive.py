@@ -41,13 +41,19 @@ class TrackDriverNode(Node):
         self._front_det = LaneDetector(target_lane=self.target_lane, use_lookahead=False)
         self._bev_det   = BevLaneDetector(target_lane=self.target_lane, use_lookahead=False)
 
-        # 제어 파라미터
-        self.kp_f = 0.65   # front: 640px 기준 offset
+        # 제어 파라미터 (비선형 PD)
+        # angle = -(kp*e + kq*e*|e| + kd*de)
+        #   kp: 선형항 — 작은 offset에서 기본 반응
+        #   kq: 2차항  — 큰 offset(코너)에서 급격히 증폭, 작은 offset에선 거의 0
+        #   kd: 미분항 — 과보정 억제
+        self.kp_f = 0.40   # front 선형 (640px)
+        self.kq_f = 0.004  # front 2차 (offset=100 → +40 추가)
         self.kd_f = 0.18
-        self.kp_b = 0.80   # BEV: 400px 기준 offset
+        self.kp_b = 0.50   # BEV 선형 (400px)
+        self.kq_b = 0.005  # BEV 2차 (offset=80 → +32 추가)
         self.kd_b = 0.20
-        self.w_f  = 0.65   # 퓨전 가중치: front (코너 반응 강함)
-        self.w_b  = 0.35   # 퓨전 가중치: BEV  (직선 정밀도 기여)
+        self.w_f  = 0.65   # 퓨전 가중치: front
+        self.w_b  = 0.35   # 퓨전 가중치: BEV
         self.base_speed = 8.0
 
         self._prev_off_f = 0.0
@@ -100,17 +106,23 @@ class TrackDriverNode(Node):
                 off_f = r_f['lane_center_offset']
                 d_f = off_f - self._prev_off_f
                 self._prev_off_f = off_f
-                raw_sum += -(self.kp_f * off_f + self.kd_f * d_f) * self.w_f
+                raw_f = -(self.kp_f * off_f
+                          + self.kq_f * off_f * abs(off_f)
+                          + self.kd_f * d_f)
+                raw_sum += raw_f * self.w_f
                 total_w += self.w_f
 
             if b_ok:
                 off_b = r_b['lane_center_offset']
                 d_b = off_b - self._prev_off_b
                 self._prev_off_b = off_b
-                raw_sum += -(self.kp_b * off_b + self.kd_b * d_b) * self.w_b
+                raw_b = -(self.kp_b * off_b
+                          + self.kq_b * off_b * abs(off_b)
+                          + self.kd_b * d_b)
+                raw_sum += raw_b * self.w_b
                 total_w += self.w_b
 
-            # 합산 후 한 번만 clip → 포화된 신호가 희석되지 않음
+            # 합산 후 한 번만 clip
             angle = float(np.clip(raw_sum / total_w, -90.0, 90.0))
 
             speed_ratio = max(0.20, 1.0 - abs(angle) / 90.0)
