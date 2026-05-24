@@ -1,0 +1,5 @@
+# Ignore FilesOfView folder
+FilesOfView/
+
+# OS X metadata
+.DS_Store

@@ -15,6 +15,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.duration import Duration
 from cv_bridge import CvBridge
 from track_drive.lane_detector import LaneDetector
+from track_drive.bev_lane_detector import BevLaneDetector
 
 #=============================================
 # ROS2 Node 클래스 정의
@@ -36,11 +37,17 @@ class TrackDriverNode(Node):
         self.bridge = CvBridge()
 
         self.target_lane = 2   # 주행 차선: 1(왼쪽) or 2(오른쪽)
-        self.lane_detector = LaneDetector(target_lane=self.target_lane)
+        # 'lookahead' = 전면뷰 + 먼곳 가중치
+        # 'bev'       = BEV + 가까운곳 가중치
+        # 'both'      = BEV + 먼곳 가중치
+        self.detector_mode = 'lookahead'
+        self.lane_detector = self._make_detector(self.detector_mode, self.target_lane)
 
         # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
-        self.kp = 0.5          # P게인: offset(px) → angle 변환 비율
+        self.kp = 0.3          # P게인 (낮출수록 덜 민감, S자 줄어듦)
+        self.kd = 0.08         # D게인 (과보정 감쇠, S자 억제)
         self.base_speed = 8.0  # 직선 기본 속도
+        self._prev_offset = 0.0
         
         # ROS2 Publisher & Subscriber 설정
         self.motor_pub = self.create_publisher(XycarMotor,'xycar_motor',10)
@@ -70,8 +77,10 @@ class TrackDriverNode(Node):
         result = self.lane_detector.detect(self.image)
         offset = result['lane_center_offset']
 
-        # P 제어: offset 양수(차가 오른쪽) → 왼쪽 조향(음수 angle)
-        angle = float(np.clip(-self.kp * offset, -50.0, 50.0))
+        # PD 제어: D항이 offset 변화 속도를 감지해 과보정 억제
+        d_offset = offset - self._prev_offset
+        self._prev_offset = offset
+        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -50.0, 50.0))
 
         # 커브(offset 클수록) 속도 감소; 최소 40%까지 허용
         speed_ratio = max(0.4, 1.0 - abs(offset) / 200.0)
@@ -84,6 +93,16 @@ class TrackDriverNode(Node):
         )
         self.drive(angle, speed)   
       
+    @staticmethod
+    def _make_detector(mode, target_lane):
+        if mode == 'lookahead':
+            return LaneDetector(target_lane=target_lane, use_lookahead=True)
+        if mode == 'bev':
+            return BevLaneDetector(target_lane=target_lane, use_lookahead=False)
+        if mode == 'both':
+            return BevLaneDetector(target_lane=target_lane, use_lookahead=True)
+        raise ValueError(f"unknown detector_mode: {mode}")
+
     #=============================================
     # 모터제어 토픽을 발행하는 Publisher 함수
     #=============================================
