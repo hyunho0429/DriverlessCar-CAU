@@ -94,7 +94,12 @@ class TrackDriverNode(Node):
             f"  {self.lane_detector.last_elapsed_ms:.1f}ms"
             f"  lane={result['current_lane']}  warn={result['solid_line_warning']}"
         )
-        self.drive(angle, speed)   
+
+        dbg = self.lane_detector.draw_debug(self.image, result)
+        cv2.imshow("track_drive", dbg)
+        cv2.waitKey(1)
+
+        self.drive(angle, speed)
       
     @staticmethod
     def _make_detector(mode, target_lane):
