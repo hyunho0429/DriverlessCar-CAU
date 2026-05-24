@@ -51,12 +51,74 @@ Sensor subscriptions use `qos_profile_sensor_data` (BEST_EFFORT) in `my_*` nodes
 
 - **`xycar_msgs/`** — CMake/`rosidl` package. Only message defs (`msg/XycarMotor.msg`, `msg/XycarUltrasonic.msg`). All Python packages list it as a runtime dep.
 - **`my_motor/`, `my_cam/`, `my_imu/`, `my_lidar/`** — single-purpose demo nodes, one file each. Useful as starting templates; their pattern is "subscribe with sensor QoS → cache latest in `self.x` → periodic `create_timer` callback prints/displays".
-- **`track_drive/track_drive.py`** — the integrated self-driving node template. Subscribes to camera + lidar, publishes `XycarMotor`. Currently runs a stub `main_loop` (alternating stop / forward) inside a blocking `while rclpy.ok()` — meaning **callbacks don't run during the loop** because `rclpy.spin` is never called. Real driving logic added here needs to either restructure around timers or interleave `rclpy.spin_once()`.
+- **`track_drive/`** — 자율주행 패키지. 아래 세 모듈로 구성됨:
+  - **`lane_detector.py`** — 전면뷰 HSV 차선 감지기. ROI(하단 40%) + 컬럼 히스토그램. `use_lookahead` 플래그로 행 가중치 방향 전환.
+  - **`bev_lane_detector.py`** — Bird's Eye View 차선 감지기. Perspective warp → HSV 마스크 → 컬럼 히스토그램. `src_pts` 보정값은 실측 기반(640×480 기준).
+  - **`track_drive.py`** — ROS2 노드. 두 detector를 동시에 돌려 결과를 융합해 `XycarMotor`를 발행.
 - **`kookmin9_viewer/test_viewer.py`** — the most useful single node for sim verification. matplotlib UI with 4 camera tiles, polar LiDAR plot, IMU arrows, and W/A/S/D control. Runs `rclpy.spin` on a background thread (matplotlib must own the main thread). It disables matplotlib's default keymap (`save`, `quit`, `pan`, …) to free `s`, `q`, `p`, etc. for vehicle control — preserve that block if you add keys. Publishes `/xycar_motor` at 10 Hz as a heartbeat (the sim treats prolonged silence as a control timeout).
 - **`ROS-TCP-Endpoint-main-ros2/`** — vendored Unity ROS-TCP-Connector endpoint. Don't modify casually; it's a snapshot of Unity-Technologies/ROS-TCP-Endpoint and most edits belong upstream.
 
-## Notes on the existing code
+## track_drive 상세
 
-- `my_motor/go.py` and `my_motor/go_stop.py` reference an undefined `driver_node` in their `finally` blocks (should be `node`). This is a latent bug — fix if you touch those files for any other reason, otherwise leave alone.
-- The codebase is bilingual (Korean comments throughout). Match the existing language when editing a file.
-- `track_drive/track_drive.py`'s header notes a commercial license restriction from Xytron; only edit it for the simulator/coursework use it was distributed for.
+### 차선 구조 (Kookmin 트랙)
+```
+[흰선] | 1차선 | [노란 점선] | 2차선 | [흰선]
+```
+- `target_lane = 1`: 왼쪽 흰선 ~ 노란선
+- `target_lane = 2`: 노란선 ~ 오른쪽 흰선 (기본값)
+
+### HSV 파라미터 (실측값)
+- 노란선: H=[20-35], S=[150-255], V=[150-255]
+- 흰선:   H=[0-180], S=[0-40],   V=[190-255]
+
+### BEV 사다리꼴 src_pts (640×480 기준, 실측 보정)
+```python
+src_pts = ((10, 415), (220, 260), (390, 260), (630, 415))
+#           좌하        좌상        우상        우하
+# y=260: 흰선 L≈225, R≈387  (y=250 이상은 배경 노이즈)
+# y=415: 흰선 L≈10,  R≈630
+```
+
+### 제어 알고리즘: 비선형 PD + 퓨전
+두 detector(front, BEV)를 매 프레임 동시 실행해 가중 합산 후 clip:
+
+```
+angle = clip(raw_f * w_f + raw_b * w_b, -90, 90)
+
+raw = -(kp * e + kq * e * |e| + kd * de)
+         선형항     2차항(코너 증폭)   미분항
+```
+
+파라미터:
+
+| | front (640px) | BEV (400px) |
+|--|--|--|
+| kp | 0.40 | 0.50 |
+| kq | 0.004 | 0.005 |
+| kd | 0.18 | 0.20 |
+| 융합 가중치 | 0.65 | 0.35 |
+
+kq 효과: offset=20px → 각도 거의 그대로 (직선 안정), offset=100px → +40° 추가 (코너 증폭)
+
+속도: `speed = base_speed * max(0.20, 1.0 - abs(angle) / 90.0)`
+
+### 감지 실패 처리
+`lane_detected=False`가 front/BEV **둘 다** 반환되면 직전 angle/speed를 그대로 발행 (`_prev_angle`, `_prev_speed`). 로그에 `[__] both lost — holding` 출력.
+
+### 디버그 창
+`cam_callback` → `_process()` → `cv2.imshow("front", ...)` + `cv2.imshow("bev", ...)` 두 창이 뜸. 각 창에서 감지된 차선 중심선, offset, source를 실시간으로 확인 가능.
+
+### 독립 실행 (시뮬레이터 없이 이미지 튜닝)
+```bash
+python3 track_drive/track_drive/lane_detector.py 이미지.png --lane 2
+python3 track_drive/track_drive/bev_lane_detector.py 이미지.png --lane 2
+python3 track_drive/track_drive/hsv_probe.py 이미지.png  # 픽셀 클릭 → HSV 확인
+```
+
+## 주요 주의사항
+
+- `my_motor/go.py`, `go_stop.py`의 `finally` 블록에서 `driver_node`를 참조하나 실제 변수명은 `node` — 잠재적 버그, 해당 파일 수정 시 같이 고칠 것.
+- 코드베이스는 한국어/영어 혼용. 파일 수정 시 기존 언어 스타일을 유지할 것.
+- `track_drive/track_drive.py` 헤더에 Xytron 상업 라이선스 명시. 시뮬레이터/수업 용도 외 배포 금지.
+- BEV `src_pts` 변경 시 반드시 실측 이미지로 검증할 것 — 직선 도로 가정 기반 보정이므로 카메라 마운트 위치가 달라지면 무효화됨.
+- 융합 계산 시 clip은 **합산 후 한 번만** 적용해야 함. 개별 clip 후 평균하면 포화된 신호가 희석됨.

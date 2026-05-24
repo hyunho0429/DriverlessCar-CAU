@@ -12,3 +12,7 @@ __pycache__/
 build/
 install/
 log/
+
+# AI Agent
+CLAUDE.md
+AGENTS.md
