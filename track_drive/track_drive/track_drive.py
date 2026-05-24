@@ -35,11 +35,18 @@ class TrackDriverNode(Node):
         self.lidar_ranges = None
         self.bridge = CvBridge()
 
-        self.target_lane = 2   # 주행 차선: 1(왼쪽) or 2(오른쪽)
+        self.target_lane = 2   # 시작 주행 차선: 1(왼쪽) or 2(오른쪽)
+        self.current_lane = self.target_lane
 
-        # 두 detector 동시 사용: front(근거리 가중) + BEV(근거리 가중)
-        self._front_det = LaneDetector(target_lane=self.target_lane, use_lookahead=False)
-        self._bev_det   = BevLaneDetector(target_lane=self.target_lane, use_lookahead=False)
+        # 1/2차선 detector를 모두 돌린 뒤, 더 신뢰도 높은 차선을 상태 기반으로 선택
+        self._front_dets = {
+            1: LaneDetector(target_lane=1, use_lookahead=False),
+            2: LaneDetector(target_lane=2, use_lookahead=False),
+        }
+        self._bev_dets = {
+            1: BevLaneDetector(target_lane=1, use_lookahead=False),
+            2: BevLaneDetector(target_lane=2, use_lookahead=False),
+        }
 
         # 제어 파라미터 (비선형 PD)
         # angle = -(kp*e + kq*e*|e| + kd*de)
@@ -56,10 +63,15 @@ class TrackDriverNode(Node):
         self.w_b  = 0.35   # 퓨전 가중치: BEV
         self.base_speed = 8.0
 
-        self._prev_off_f = 0.0
-        self._prev_off_b = 0.0
+        self._prev_off_f = {1: 0.0, 2: 0.0}
+        self._prev_off_b = {1: 0.0, 2: 0.0}
         self._prev_angle = 0.0
         self._prev_speed = 0.0
+        self._candidate_lane = None
+        self._candidate_count = 0
+        self._switch_confirm_frames = 4
+        self._switch_margin = 0.25
+        self._min_switch_score = 0.55
 
         # ROS2 Publisher & Subscriber 설정
         self.motor_pub = self.create_publisher(XycarMotor, 'xycar_motor', 10)
@@ -86,8 +98,17 @@ class TrackDriverNode(Node):
         if self.image is None:
             return
 
-        r_f = self._front_det.detect(self.image)
-        r_b = self._bev_det.detect(self.image)
+        results = {}
+        scores = {}
+        for lane in (1, 2):
+            r_f = self._front_dets[lane].detect(self.image)
+            r_b = self._bev_dets[lane].detect(self.image)
+            results[lane] = (r_f, r_b)
+            scores[lane] = self._lane_score(r_f, r_b)
+
+        self._update_current_lane(scores)
+
+        r_f, r_b = results[self.current_lane]
 
         f_ok = r_f['lane_detected']
         b_ok = r_b['lane_detected']
@@ -96,7 +117,9 @@ class TrackDriverNode(Node):
             # 둘 다 실패 → 직전 명령 유지
             angle, speed = self._prev_angle, self._prev_speed
             self.get_logger().warn(
-                f"[__] both lost — holding  angle={angle:+.1f}  speed={speed:.1f}"
+                f"[L{self.current_lane} __] selected lane lost — holding  "
+                f"angle={angle:+.1f}  speed={speed:.1f}  "
+                f"score=({scores[1]:.2f},{scores[2]:.2f})"
             )
         else:
             raw_sum = 0.0
@@ -104,8 +127,8 @@ class TrackDriverNode(Node):
 
             if f_ok:
                 off_f = r_f['lane_center_offset']
-                d_f = off_f - self._prev_off_f
-                self._prev_off_f = off_f
+                d_f = off_f - self._prev_off_f[self.current_lane]
+                self._prev_off_f[self.current_lane] = off_f
                 raw_f = -(self.kp_f * off_f
                           + self.kq_f * off_f * abs(off_f)
                           + self.kd_f * d_f)
@@ -114,8 +137,8 @@ class TrackDriverNode(Node):
 
             if b_ok:
                 off_b = r_b['lane_center_offset']
-                d_b = off_b - self._prev_off_b
-                self._prev_off_b = off_b
+                d_b = off_b - self._prev_off_b[self.current_lane]
+                self._prev_off_b[self.current_lane] = off_b
                 raw_b = -(self.kp_b * off_b
                           + self.kq_b * off_b * abs(off_b)
                           + self.kd_b * d_b)
@@ -134,17 +157,69 @@ class TrackDriverNode(Node):
             f_str = f"f={r_f['lane_center_offset']:+.0f}" if f_ok else "f=X"
             b_str = f"b={r_b['lane_center_offset']:+.0f}" if b_ok else "b=X"
             self.get_logger().info(
-                f"[{src}] angle={angle:+.1f}  speed={speed:.1f}  {f_str}  {b_str}"
+                f"[L{self.current_lane} {src}] angle={angle:+.1f}  speed={speed:.1f}  "
+                f"{f_str}  {b_str}  score=({scores[1]:.2f},{scores[2]:.2f})"
             )
 
         # 디버그 창
-        dbg_f = self._front_det.draw_debug(self.image, r_f)
-        dbg_b = self._bev_det.draw_debug(self.image, r_b)
+        dbg_f = self._front_dets[self.current_lane].draw_debug(self.image, r_f)
+        dbg_b = self._bev_dets[self.current_lane].draw_debug(self.image, r_b)
         cv2.imshow("front", dbg_f)
         cv2.imshow("bev",   dbg_b)
         cv2.waitKey(1)
 
         self.drive(angle, speed)
+
+    def _lane_score(self, r_f, r_b):
+        score = 0.0
+        if r_f['lane_detected']:
+            score += self.w_f * self._source_score(r_f.get('source'))
+        if r_b['lane_detected']:
+            score += self.w_b * self._source_score(r_b.get('source'))
+        return float(score)
+
+    @staticmethod
+    def _source_score(source):
+        return {
+            'both': 1.0,
+            'left+w': 0.75,
+            'right+w': 0.75,
+            'left_only': 0.45,
+            'right_only': 0.45,
+        }.get(source, 0.0)
+
+    def _update_current_lane(self, scores):
+        other_lane = 1 if self.current_lane == 2 else 2
+        current_score = scores[self.current_lane]
+        other_score = scores[other_lane]
+
+        should_consider = (
+            other_score >= self._min_switch_score and
+            other_score >= current_score + self._switch_margin
+        )
+
+        if not should_consider:
+            self._candidate_lane = None
+            self._candidate_count = 0
+            return
+
+        if self._candidate_lane != other_lane:
+            self._candidate_lane = other_lane
+            self._candidate_count = 1
+            return
+
+        self._candidate_count += 1
+        if self._candidate_count < self._switch_confirm_frames:
+            return
+
+        old_lane = self.current_lane
+        self.current_lane = other_lane
+        self._candidate_lane = None
+        self._candidate_count = 0
+        self.get_logger().warn(
+            f"lane switch: L{old_lane} -> L{self.current_lane}  "
+            f"score=({scores[1]:.2f},{scores[2]:.2f})"
+        )
 
     #=============================================
     # 모터제어 토픽을 발행하는 Publisher 함수

@@ -113,6 +113,7 @@ class BevLaneDetector:
         return {
             'lane_center_offset': float(offset),
             'lane_detected': bool(lane_detected),
+            'source': source,
             'solid_line_warning': bool(solid_line_warning),
             'current_lane': self.target_lane,
         }
