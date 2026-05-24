@@ -20,12 +20,12 @@ import numpy as np
 class LaneDetector:
     def __init__(
         self,
-        roi_top_ratio=0.55,
+        roi_top_ratio=0.60,
         smoothing_window=5,
-        lower_yellow=(20, 100, 100),
+        lower_yellow=(20, 150, 150),
         upper_yellow=(35, 255, 255),
-        lower_white=(0, 0, 200),
-        upper_white=(180, 30, 255),
+        lower_white=(0, 0, 190),
+        upper_white=(180, 40, 255),
     ):
         self.roi_top_ratio = roi_top_ratio
         self.lower_yellow = np.array(lower_yellow, dtype=np.uint8)
@@ -53,12 +53,18 @@ class LaneDetector:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         yellow_mask = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
         white_mask = cv2.inRange(hsv, self.lower_white, self.upper_white)
+
+        # 점선 갭을 메워서 끊긴 노란선을 연결
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+
         combined = cv2.bitwise_or(yellow_mask, white_mask)
 
         edges = cv2.Canny(combined, 50, 150)
         segments = cv2.HoughLinesP(
             edges, rho=1, theta=np.pi / 180,
-            threshold=30, minLineLength=20, maxLineGap=20,
+            threshold=20, minLineLength=15, maxLineGap=40,
         )
         left_x, right_x = self._fit_left_right(segments, rw, ref_y)
 
@@ -111,7 +117,7 @@ class LaneDetector:
             if x2 == x1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
-            if abs(slope) < 0.3:
+            if abs(slope) < 0.2:
                 continue
             x_mean = (x1 + x2) / 2.0
             # Image y grows downward, so the left lane line has negative slope.
