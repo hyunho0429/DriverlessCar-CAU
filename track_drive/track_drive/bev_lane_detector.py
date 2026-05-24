@@ -24,8 +24,9 @@ class BevLaneDetector:
         self,
         target_lane=2,
         # 원본 이미지(640x480 기준) 도로 사다리꼴: (좌하, 좌상, 우상, 우하)
-        src_pts=((40, 470), (270, 290), (370, 290), (600, 470)),
-        bev_size=(400, 600),    # (width, height) — BEV 출력 크기
+        # 실측값: y=290 흰선(L=184,R=440), y=415 흰선(L=10,R=630)
+        src_pts=((10, 415), (180, 290), (445, 290), (630, 415)),
+        bev_size=(400, 400),    # (width, height) — BEV 출력 크기
         use_lookahead=False,    # True: BEV 중상단 가중치 ↑
         smoothing_window=5,
         lower_yellow=(20, 150, 150),

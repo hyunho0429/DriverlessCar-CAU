@@ -3,3 +3,12 @@ FilesOfView/
 
 # OS X metadata
 .DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# ROS 2 build directories
+build/
+install/
+log/

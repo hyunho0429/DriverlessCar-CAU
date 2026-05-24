@@ -44,8 +44,11 @@ class TrackDriverNode(Node):
         self.lane_detector = self._make_detector(self.detector_mode, self.target_lane)
 
         # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
-        self.kp = 0.3          # P게인 (낮출수록 덜 민감, S자 줄어듦)
-        self.kd = 0.08         # D게인 (과보정 감쇠, S자 억제)
+        # lookahead: 640px 기준 offset, bev/both: 400px 기준 offset (스케일 보정됨)
+        _kp_table = {'lookahead': 0.30, 'bev': 0.45, 'both': 0.45}
+        _kd_table = {'lookahead': 0.08, 'bev': 0.12, 'both': 0.12}
+        self.kp = _kp_table[self.detector_mode]
+        self.kd = _kd_table[self.detector_mode]
         self.base_speed = 8.0  # 직선 기본 속도
         self._prev_offset = 0.0
         
