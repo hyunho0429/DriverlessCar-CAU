@@ -45,8 +45,8 @@ class TrackDriverNode(Node):
 
         # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
         # lookahead: 640px 기준 offset, bev/both: 400px 기준 offset (스케일 보정됨)
-        _kp_table = {'lookahead': 0.30, 'bev': 0.45, 'both': 0.45}
-        _kd_table = {'lookahead': 0.08, 'bev': 0.12, 'both': 0.12}
+        _kp_table = {'lookahead': 0.50, 'bev': 0.80, 'both': 0.80}
+        _kd_table = {'lookahead': 0.12, 'bev': 0.20, 'both': 0.20}
         self.kp = _kp_table[self.detector_mode]
         self.kd = _kd_table[self.detector_mode]
         self.base_speed = 8.0  # 직선 기본 속도
@@ -83,11 +83,11 @@ class TrackDriverNode(Node):
         # PD 제어: D항이 offset 변화 속도를 감지해 과보정 억제
         d_offset = offset - self._prev_offset
         self._prev_offset = offset
-        # Xycar angle 범위: ±100. 직선 정밀제어는 ±50, 코너 대응은 ±80까지 허용
-        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -80.0, 80.0))
+        # Xycar angle 범위: ±100
+        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -90.0, 90.0))
 
-        # 조향각 기반 속도 감소: angle이 클수록(=코너) 속도 감소, 최소 25%
-        speed_ratio = max(0.25, 1.0 - abs(angle) / 80.0)
+        # 조향각 기반 속도 감소: angle이 클수록(=코너) 속도 감소, 최소 20%
+        speed_ratio = max(0.20, 1.0 - abs(angle) / 90.0)
         speed = self.base_speed * speed_ratio
 
         self.get_logger().info(
