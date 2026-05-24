@@ -14,6 +14,7 @@ from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.duration import Duration
 from cv_bridge import CvBridge
+from track_drive.lane_detector import LaneDetector
 
 #=============================================
 # ROS2 Node 클래스 정의
@@ -30,9 +31,15 @@ class TrackDriverNode(Node):
         
         # 상수값 및 초기값 설정
         self.image = None  # 카메라 토픽 데이터를 저장할 변수
-        self.motor_msg = XycarMotor()  # 모터토픽 메시지        
+        self.motor_msg = XycarMotor()  # 모터토픽 메시지
         self.lidar_ranges = None
         self.bridge = CvBridge()
+
+        self.lane_detector = LaneDetector()
+
+        # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
+        self.kp = 0.5          # P게인: offset(px) → angle 변환 비율
+        self.base_speed = 8.0  # 직선 기본 속도
         
         # ROS2 Publisher & Subscriber 설정
         self.motor_pub = self.create_publisher(XycarMotor,'xycar_motor',10)
@@ -49,14 +56,32 @@ class TrackDriverNode(Node):
     # 카메라 토픽을 수신하는 콜백 함수
     #=============================================
     def cam_callback(self, data):
-        # 수신한 메시지를 OpenCV 이미지로 변환하여 저장
         self.image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        self._process()
     
-    #=============================================
-    # 라이다 토픽을 수신하는 콜백 함수
-    #=============================================
     def lidar_callback(self, msg):
-        self.lidar_ranges = msg.ranges   
+        self.lidar_ranges = msg.ranges
+
+    def _process(self):
+        if self.image is None:
+            return
+
+        result = self.lane_detector.detect(self.image)
+        offset = result['lane_center_offset']
+
+        # P 제어: offset 양수(차가 오른쪽) → 왼쪽 조향(음수 angle)
+        angle = float(np.clip(-self.kp * offset, -50.0, 50.0))
+
+        # 커브(offset 클수록) 속도 감소; 최소 40%까지 허용
+        speed_ratio = max(0.4, 1.0 - abs(offset) / 200.0)
+        speed = self.base_speed * speed_ratio
+
+        self.get_logger().info(
+            f"offset={offset:+.1f}px  angle={angle:+.1f}  speed={speed:.1f}"
+            f"  {self.lane_detector.last_elapsed_ms:.1f}ms"
+            f"  lane={result['current_lane']}  warn={result['solid_line_warning']}"
+        )
+        self.drive(angle, speed)   
       
     #=============================================
     # 모터제어 토픽을 발행하는 Publisher 함수
@@ -70,20 +95,10 @@ class TrackDriverNode(Node):
     # 메인 루프
     #=============================================
     def main_loop(self):
-    
         self.get_logger().info("======================================")
         self.get_logger().info("  S T A R T    D R I V I N G ...      ")
         self.get_logger().info("======================================")
-
-        while rclpy.ok():
-        
-            for _ in range(15):
-                self.drive(angle=0,speed=0)
-                time.sleep(0.1)
-
-            for _ in range(15):
-                self.drive(angle=0,speed=5)
-                time.sleep(0.1)
+        rclpy.spin(self)
                 
 #=============================================
 # 메인 함수
