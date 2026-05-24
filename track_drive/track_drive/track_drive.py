@@ -83,10 +83,11 @@ class TrackDriverNode(Node):
         # PD 제어: D항이 offset 변화 속도를 감지해 과보정 억제
         d_offset = offset - self._prev_offset
         self._prev_offset = offset
-        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -50.0, 50.0))
+        # Xycar angle 범위: ±100. 직선 정밀제어는 ±50, 코너 대응은 ±80까지 허용
+        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -80.0, 80.0))
 
-        # 커브(offset 클수록) 속도 감소; 최소 40%까지 허용
-        speed_ratio = max(0.4, 1.0 - abs(offset) / 200.0)
+        # 조향각 기반 속도 감소: angle이 클수록(=코너) 속도 감소, 최소 25%
+        speed_ratio = max(0.25, 1.0 - abs(angle) / 80.0)
         speed = self.base_speed * speed_ratio
 
         self.get_logger().info(

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """ROI 내 픽셀을 클릭하면 BGR / HSV 값을 출력합니다.
-노란선, 흰선, 도로를 각각 클릭해서 실제 HSV 범위를 확인하세요.
+노란선, 흰선, 도로를 각각 클릭해서 실제 HSV 범위 확인
 
 실행:
     python3 hsv_probe.py 이미지경로.jpg
 """
+
+# 확인용코드입니다!!!
+
 import sys
 import cv2
 import numpy as np
