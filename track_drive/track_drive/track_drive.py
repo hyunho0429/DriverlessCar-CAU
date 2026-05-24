@@ -93,25 +93,25 @@ class TrackDriverNode(Node):
                 f"[__] both lost — holding  angle={angle:+.1f}  speed={speed:.1f}"
             )
         else:
-            weighted_angles = []
+            raw_sum = 0.0
+            total_w = 0.0
 
             if f_ok:
                 off_f = r_f['lane_center_offset']
                 d_f = off_f - self._prev_off_f
                 self._prev_off_f = off_f
-                a_f = float(np.clip(-(self.kp_f * off_f + self.kd_f * d_f), -90.0, 90.0))
-                weighted_angles.append((a_f, self.w_f))
+                raw_sum += -(self.kp_f * off_f + self.kd_f * d_f) * self.w_f
+                total_w += self.w_f
 
             if b_ok:
                 off_b = r_b['lane_center_offset']
                 d_b = off_b - self._prev_off_b
                 self._prev_off_b = off_b
-                a_b = float(np.clip(-(self.kp_b * off_b + self.kd_b * d_b), -90.0, 90.0))
-                weighted_angles.append((a_b, self.w_b))
+                raw_sum += -(self.kp_b * off_b + self.kd_b * d_b) * self.w_b
+                total_w += self.w_b
 
-            # 감지된 것만으로 가중 평균
-            total_w = sum(w for _, w in weighted_angles)
-            angle = sum(a * w for a, w in weighted_angles) / total_w
+            # 합산 후 한 번만 clip → 포화된 신호가 희석되지 않음
+            angle = float(np.clip(raw_sum / total_w, -90.0, 90.0))
 
             speed_ratio = max(0.20, 1.0 - abs(angle) / 90.0)
             speed = self.base_speed * speed_ratio
