@@ -37,20 +37,24 @@ class TrackDriverNode(Node):
         self.bridge = CvBridge()
 
         self.target_lane = 2   # 주행 차선: 1(왼쪽) or 2(오른쪽)
+        # 'reactive'  = 전면뷰 + 가까운곳 가중치  ← 코너 대응에 가장 강함
         # 'lookahead' = 전면뷰 + 먼곳 가중치
         # 'bev'       = BEV + 가까운곳 가중치
         # 'both'      = BEV + 먼곳 가중치
-        self.detector_mode = 'lookahead'
+        self.detector_mode = 'reactive'
         self.lane_detector = self._make_detector(self.detector_mode, self.target_lane)
 
-        # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
-        # lookahead: 640px 기준 offset, bev/both: 400px 기준 offset (스케일 보정됨)
-        _kp_table = {'lookahead': 0.50, 'bev': 0.80, 'both': 0.80}
-        _kd_table = {'lookahead': 0.12, 'bev': 0.20, 'both': 0.20}
+        # 제어 파라미터
+        # reactive/lookahead: 640px 기준 offset → kp 낮게
+        # bev/both: 400px 기준 offset → kp 높게
+        _kp_table = {'reactive': 0.65, 'lookahead': 0.50, 'bev': 0.80, 'both': 0.80}
+        _kd_table = {'reactive': 0.18, 'lookahead': 0.12, 'bev': 0.20, 'both': 0.20}
         self.kp = _kp_table[self.detector_mode]
         self.kd = _kd_table[self.detector_mode]
         self.base_speed = 8.0  # 직선 기본 속도
         self._prev_offset = 0.0
+        self._prev_angle = 0.0
+        self._prev_speed = 0.0
         
         # ROS2 Publisher & Subscriber 설정
         self.motor_pub = self.create_publisher(XycarMotor,'xycar_motor',10)
@@ -78,23 +82,27 @@ class TrackDriverNode(Node):
             return
 
         result = self.lane_detector.detect(self.image)
-        offset = result['lane_center_offset']
 
-        # PD 제어: D항이 offset 변화 속도를 감지해 과보정 억제
-        d_offset = offset - self._prev_offset
-        self._prev_offset = offset
-        # Xycar angle 범위: ±100
-        angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -90.0, 90.0))
-
-        # 조향각 기반 속도 감소: angle이 클수록(=코너) 속도 감소, 최소 20%
-        speed_ratio = max(0.20, 1.0 - abs(angle) / 90.0)
-        speed = self.base_speed * speed_ratio
-
-        self.get_logger().info(
-            f"offset={offset:+.1f}px  angle={angle:+.1f}  speed={speed:.1f}"
-            f"  {self.lane_detector.last_elapsed_ms:.1f}ms"
-            f"  lane={result['current_lane']}  warn={result['solid_line_warning']}"
-        )
+        if not result['lane_detected']:
+            # 차선 미감지: 직전 명령 유지
+            angle, speed = self._prev_angle, self._prev_speed
+            self.get_logger().warn(
+                f"lane lost — holding  angle={angle:+.1f}  speed={speed:.1f}"
+            )
+        else:
+            offset = result['lane_center_offset']
+            d_offset = offset - self._prev_offset
+            self._prev_offset = offset
+            angle = float(np.clip(-(self.kp * offset + self.kd * d_offset), -90.0, 90.0))
+            speed_ratio = max(0.20, 1.0 - abs(angle) / 90.0)
+            speed = self.base_speed * speed_ratio
+            self._prev_angle = angle
+            self._prev_speed = speed
+            self.get_logger().info(
+                f"offset={offset:+.1f}px  angle={angle:+.1f}  speed={speed:.1f}"
+                f"  {self.lane_detector.last_elapsed_ms:.1f}ms"
+                f"  lane={result['current_lane']}  warn={result['solid_line_warning']}"
+            )
 
         dbg = self.lane_detector.draw_debug(self.image, result)
         cv2.imshow("track_drive", dbg)
@@ -104,6 +112,8 @@ class TrackDriverNode(Node):
       
     @staticmethod
     def _make_detector(mode, target_lane):
+        if mode == 'reactive':
+            return LaneDetector(target_lane=target_lane, use_lookahead=False)
         if mode == 'lookahead':
             return LaneDetector(target_lane=target_lane, use_lookahead=True)
         if mode == 'bev':
