@@ -35,7 +35,8 @@ class TrackDriverNode(Node):
         self.lidar_ranges = None
         self.bridge = CvBridge()
 
-        self.lane_detector = LaneDetector()
+        self.target_lane = 2   # 주행 차선: 1(왼쪽) or 2(오른쪽)
+        self.lane_detector = LaneDetector(target_lane=self.target_lane)
 
         # 제어 파라미터 — 시뮬레이터 결과에 따라 조정
         self.kp = 0.5          # P게인: offset(px) → angle 변환 비율

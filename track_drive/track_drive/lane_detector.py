@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Lane detector for the Xytron Unity simulator (Kookmin qualifier track).
 
-Pure CV (HSV mask + Hough) with no ROS dependency so HSV ranges and ROI can
-be tuned against static screenshots before being wired into track_drive.py.
+Lane layout:  [white] | Lane 1 | [yellow dashed] | Lane 2 | [white]
 
+Pure CV (HSV mask + column histogram) with no ROS dependency.
 Run directly with one or more image paths to see the debug overlay:
 
-    python3 lane_detector.py screenshot1.png screenshot2.png
+    python3 lane_detector.py screenshot.png
 """
 
 import argparse
@@ -20,6 +20,7 @@ import numpy as np
 class LaneDetector:
     def __init__(
         self,
+        target_lane=2,
         roi_top_ratio=0.60,
         smoothing_window=5,
         lower_yellow=(20, 150, 150),
@@ -27,6 +28,7 @@ class LaneDetector:
         lower_white=(0, 0, 190),
         upper_white=(180, 40, 255),
     ):
+        self.target_lane = target_lane      # 1 or 2
         self.roi_top_ratio = roi_top_ratio
         self.lower_yellow = np.array(lower_yellow, dtype=np.uint8)
         self.upper_yellow = np.array(upper_yellow, dtype=np.uint8)
@@ -48,100 +50,78 @@ class LaneDetector:
         y0 = int(h * self.roi_top_ratio)
         roi = frame[y0:, :]
         rh, rw = roi.shape[:2]
-        ref_y = rh - 1
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         yellow_mask = cv2.inRange(hsv, self.lower_yellow, self.upper_yellow)
-        white_mask = cv2.inRange(hsv, self.lower_white, self.upper_white)
+        white_mask  = cv2.inRange(hsv, self.lower_white,  self.upper_white)
 
-        # 점선 갭을 메워서 끊긴 노란선을 연결
+        # 점선 갭 연결
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+        white_mask  = cv2.morphologyEx(white_mask,  cv2.MORPH_CLOSE, kernel)
 
-        combined = cv2.bitwise_or(yellow_mask, white_mask)
+        # 각 선의 x좌표 추출
+        yellow_x      = self._line_x(yellow_mask)
+        left_white_x  = self._line_x(white_mask, x_max=rw // 2)
+        right_white_x = self._line_x(white_mask, x_min=rw // 2)
 
-        edges = cv2.Canny(combined, 50, 150)
-        segments = cv2.HoughLinesP(
-            edges, rho=1, theta=np.pi / 180,
-            threshold=20, minLineLength=15, maxLineGap=40,
-        )
-        left_x, right_x = self._fit_left_right(segments, rw, ref_y)
+        # 목표 차선에 따라 경계 선택
+        # Lane 1: 왼쪽 흰선 ~ 노란선
+        # Lane 2: 노란선   ~ 오른쪽 흰선
+        if self.target_lane == 1:
+            left_x, right_x = left_white_x, yellow_x
+        else:
+            left_x, right_x = yellow_x, right_white_x
 
         lane_center_x, source = self._lane_center(left_x, right_x, rw)
         lane_detected = lane_center_x is not None
 
         if lane_center_x is None:
-            # No data this frame: hold last value (brief: never emit garbage).
+            # 감지 실패: 직전 값 유지
             offset = self._last_offset
         else:
-            # Sign per brief: deviation of the *vehicle* from the lane center.
-            # Camera is body-fixed, so vehicle x in image == image_center_x;
-            # therefore offset = image_center_x - lane_center_x (not the reverse).
+            # 차량 편차 = 카메라 중심 - 차선 중심
             raw = image_center_x - lane_center_x
             self._offset_history.append(raw)
             offset = float(np.mean(self._offset_history))
             self._last_offset = offset
 
-        current_lane = self._classify_lane(yellow_mask, rw)
         solid_line_warning = self._white_near_center(white_mask, rw)
 
         self.last_elapsed_ms = (time.time() - t0) * 1000.0
         self._dbg = dict(
             roi_origin_y=y0,
             roi_shape=(rh, rw),
+            yellow_x=yellow_x,
+            left_white_x=left_white_x,
+            right_white_x=right_white_x,
             left_x=left_x,
             right_x=right_x,
             lane_center_x=lane_center_x,
             source=source,
-            segments=segments,
         )
 
         return {
             'lane_center_offset': float(offset),
             'lane_detected': bool(lane_detected),
             'solid_line_warning': bool(solid_line_warning),
-            'current_lane': current_lane,
+            'current_lane': self.target_lane,
         }
 
     # --- helpers --------------------------------------------------------
 
-    def _fit_left_right(self, segments, width, ref_y):
-        if segments is None:
-            return None, None
-
-        left_pts, right_pts = [], []
-        mid = width / 2.0
-        for seg in segments:
-            x1, y1, x2, y2 = seg[0]
-            if x2 == x1:
-                continue
-            slope = (y2 - y1) / (x2 - x1)
-            if abs(slope) < 0.2:
-                continue
-            x_mean = (x1 + x2) / 2.0
-            # Image y grows downward, so the left lane line has negative slope.
-            if slope < 0 and x_mean < mid:
-                left_pts.extend([(x1, y1), (x2, y2)])
-            elif slope > 0 and x_mean > mid:
-                right_pts.extend([(x1, y1), (x2, y2)])
-
-        return (
-            self._fit_x_at_y(left_pts, ref_y),
-            self._fit_x_at_y(right_pts, ref_y),
-        )
-
     @staticmethod
-    def _fit_x_at_y(pts, ref_y):
-        if len(pts) < 2:
+    def _line_x(mask, x_min=0, x_max=None):
+        """ROI 하단 1/3 영역의 컬럼 히스토그램으로 라인 x좌표 추출."""
+        if x_max is None:
+            x_max = mask.shape[1]
+        region = mask[mask.shape[0] * 2 // 3:, x_min:x_max]
+        hist = region.sum(axis=0).astype(np.float32)
+        if hist.max() == 0:
             return None
-        ys = np.array([p[1] for p in pts], dtype=np.float32)
-        xs = np.array([p[0] for p in pts], dtype=np.float32)
-        if np.unique(ys).size < 2:
-            return float(np.mean(xs))
-        # Fit x = m*y + c so near-vertical lane lines stay well-conditioned.
-        m, c = np.polyfit(ys, xs, 1)
-        return float(m * ref_y + c)
+        # 가중 평균으로 라인 중심 x 계산 (argmax보다 안정적)
+        indices = np.arange(len(hist))
+        return x_min + float(np.sum(hist * indices) / hist.sum())
 
     def _lane_center(self, left_x, right_x, width):
         if left_x is not None and right_x is not None:
@@ -151,20 +131,12 @@ class LaneDetector:
             return left_x + self._last_lane_width / 2.0, 'left+w'
         if right_x is not None and self._last_lane_width:
             return right_x - self._last_lane_width / 2.0, 'right+w'
-        # No remembered width yet: assume the missing side sits at the frame edge.
+        # 차선 폭 미확보: 프레임 끝을 경계로 추정
         if left_x is not None:
             return (left_x + width) / 2.0, 'left_only'
         if right_x is not None:
             return right_x / 2.0, 'right_only'
         return None, 'none'
-
-    @staticmethod
-    def _classify_lane(yellow_mask, width):
-        if yellow_mask.sum() == 0:
-            return None
-        peak_x = int(np.argmax(yellow_mask.sum(axis=0)))
-        # Yellow center on the right side of the camera => we are in left lane (1).
-        return 1 if peak_x > width // 2 else 2
 
     @staticmethod
     def _white_near_center(white_mask, width, band_ratio=0.15):
@@ -180,34 +152,40 @@ class LaneDetector:
     def draw_debug(self, frame, result):
         out = frame.copy()
         h, w = out.shape[:2]
-        y0 = self._dbg.get('roi_origin_y', 0)
+        y0   = self._dbg.get('roi_origin_y', 0)
         rh, rw = self._dbg.get('roi_shape', (h - y0, w))
+        ref_y = y0 + rh - 1
 
+        # ROI 경계
         cv2.rectangle(out, (0, y0), (w - 1, h - 1), (0, 255, 255), 1)
 
-        segments = self._dbg.get('segments')
-        if segments is not None:
-            for seg in segments:
-                x1, y1, x2, y2 = seg[0]
-                cv2.line(out, (x1, y0 + y1), (x2, y0 + y2), (180, 180, 180), 1)
+        # 노란선 (노란 원)
+        yx = self._dbg.get('yellow_x')
+        if yx is not None:
+            cv2.circle(out, (int(yx), ref_y), 8, (0, 215, 255), -1)
 
-        ref_y = y0 + rh - 1
-        if self._dbg.get('left_x') is not None:
-            cv2.circle(out, (int(self._dbg['left_x']), ref_y), 8, (0, 255, 0), -1)
-        if self._dbg.get('right_x') is not None:
-            cv2.circle(out, (int(self._dbg['right_x']), ref_y), 8, (0, 0, 255), -1)
-        if self._dbg.get('lane_center_x') is not None:
-            cx = int(self._dbg['lane_center_x'])
-            cv2.line(out, (cx, y0), (cx, h - 1), (0, 255, 0), 2)
+        # 흰선 좌 (초록 원) / 우 (빨간 원)
+        lwx = self._dbg.get('left_white_x')
+        rwx = self._dbg.get('right_white_x')
+        if lwx is not None:
+            cv2.circle(out, (int(lwx), ref_y), 8, (0, 255, 0), -1)
+        if rwx is not None:
+            cv2.circle(out, (int(rwx), ref_y), 8, (0, 0, 255), -1)
+
+        # 계산된 차선 중심 (흰 세로선)
+        cx = self._dbg.get('lane_center_x')
+        if cx is not None:
+            cv2.line(out, (int(cx), y0), (int(cx), h - 1), (255, 255, 255), 2)
+
+        # 카메라 중심 (파란 세로선)
         cv2.line(out, (w // 2, y0), (w // 2, h - 1), (255, 0, 0), 1)
 
         hud = [
-            f"offset = {result['lane_center_offset']:+7.2f} px"
+            f"[lane {self.target_lane}]  offset = {result['lane_center_offset']:+7.2f} px"
             f"   ({self._dbg.get('source')})",
-            f"lane   = {result['current_lane']}"
-            f"   detected = {result['lane_detected']}"
+            f"detected = {result['lane_detected']}"
             f"   warn = {result['solid_line_warning']}",
-            f"time   = {self.last_elapsed_ms:5.2f} ms",
+            f"time = {self.last_elapsed_ms:5.2f} ms",
         ]
         for i, line in enumerate(hud):
             cv2.putText(out, line, (10, 22 + 22 * i),
@@ -220,11 +198,12 @@ class LaneDetector:
 def _cli():
     ap = argparse.ArgumentParser(description="LaneDetector standalone tuner")
     ap.add_argument("images", nargs="+", help="image file path(s)")
-    ap.add_argument("--no-show", action="store_true",
-                    help="skip cv2.imshow (headless tuning)")
+    ap.add_argument("--lane", type=int, default=2, choices=[1, 2],
+                    help="target lane (default: 2)")
+    ap.add_argument("--no-show", action="store_true")
     args = ap.parse_args()
 
-    det = LaneDetector()
+    det = LaneDetector(target_lane=args.lane)
     for path in args.images:
         frame = cv2.imread(path)
         if frame is None:
@@ -237,7 +216,7 @@ def _cli():
         dbg = det.draw_debug(frame, result)
         cv2.imshow("LaneDetector", dbg)
         k = cv2.waitKey(0) & 0xFF
-        if k == 27:  # ESC
+        if k == 27:
             break
     cv2.destroyAllWindows()
 
