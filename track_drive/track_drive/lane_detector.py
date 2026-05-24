@@ -112,14 +112,16 @@ class LaneDetector:
 
     @staticmethod
     def _line_x(mask, x_min=0, x_max=None):
-        """ROI 하단 1/3 영역의 컬럼 히스토그램으로 라인 x좌표 추출."""
+        """컬럼 히스토그램으로 라인 x좌표 추출.
+        하단에 가까울수록 가중치를 높여 가까운 차선 위치에 더 집중."""
         if x_max is None:
             x_max = mask.shape[1]
-        region = mask[mask.shape[0] * 2 // 3:, x_min:x_max]
-        hist = region.sum(axis=0).astype(np.float32)
+        region = mask[:, x_min:x_max].astype(np.float32)
+        # 하단 행일수록 가중치 높음 (0.5 ~ 1.0)
+        row_w = np.linspace(0.5, 1.0, region.shape[0])[:, np.newaxis]
+        hist = (region * row_w).sum(axis=0)
         if hist.max() == 0:
             return None
-        # 가중 평균으로 라인 중심 x 계산 (argmax보다 안정적)
         indices = np.arange(len(hist))
         return x_min + float(np.sum(hist * indices) / hist.sum())
 
