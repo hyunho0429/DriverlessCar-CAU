@@ -39,13 +39,14 @@ class LidarConeController:
         self.MIN_CONE_DIST = 0.35
         self.MAX_CONE_DIST = 8.0
 
-        # 차체에 가려지지 않는 시야: 인덱스 247~113 (총 226도)
-        # 정규화 후 |deg| < 115도가 정확히 이 시야와 일치.
-        self.FRONT_ANGLE_LIMIT = 115.0
+        # 차체에 가려지지 않는 시야는 |deg|<115도지만, 가까운 측방 라바콘을
+        # 놓치지 않도록 120도까지 허용. MIN_CONE_DIST=0.35가 차체 반사를 계속 차단.
+        self.FRONT_ANGLE_LIMIT = 120.0
 
         # 차량 좌표계 ROI
         # x: 전방, y: 좌우 (sim 기준 y<0 이 실제 왼쪽)
-        self.X_MIN = 0.20
+        # X_MIN을 0.10으로 낮춰 차 바로 앞 라바콘도 포함 (차체 반사는 MIN_CONE_DIST가 차단)
+        self.X_MIN = 0.10
         self.X_MAX = 7.0
         self.Y_LIMIT = 3.5
 
@@ -70,13 +71,21 @@ class LidarConeController:
         self.X_BIN_STEP = 0.4
         self.X_BIN_HALF = 0.30
 
-        # 라바콘 통로 폭 sanity check (bin별 페어에 적용)
-        self.CONE_WIDTH_MIN = 0.30
-        self.CONE_WIDTH_MAX = 6.0
+        # 라바콘 통로 폭 sanity check (실측 트랙 4.0~4.5m 기준)
+        self.CONE_WIDTH_MIN = 2.0
+        self.CONE_WIDTH_MAX = 8.0
 
         # 한쪽만 보일 때 폴백 허용 (곡선에서 흔함)
         self.ALLOW_SINGLE_SIDE_PATH = True
-        self.CONE_LANE_HALF_WIDTH = 0.68
+
+        # 차선 절반폭(half-width) 동적 추정 — 양쪽 페어가 잡힐 때마다 EMA 갱신
+        self.LANE_HALF_WIDTH_INIT = 2.2     # 트랙 4.4m 가정
+        self.LANE_WIDTH_EMA_ALPHA = 0.15
+        self._lane_half_width_est = self.LANE_HALF_WIDTH_INIT
+
+        # Single-side 회피 부스트: 한쪽 라바콘에 가까울수록 반대쪽으로 강하게 꺾기
+        self.SINGLE_SIDE_AVOID_THRESHOLD = 1.5   # 이 거리부터 부스트 시작 [m]
+        self.SINGLE_SIDE_AVOID_MAX_BOOST = 2.0   # 0m 거리 최대 부스트 배수
 
         # single-side 폴백에서 사용하는 점 개수
         self.SIDE_SELECT_N = 4
@@ -115,10 +124,11 @@ class LidarConeController:
         #=============================================
         # [8] 모드별 속도 [m/s]
         #=============================================
+        # 디버깅 단계에서 절반 속도 — 안정화 후 다시 올릴 것
         self.SPEED_BY_MODE = {
-            "STRAIGHT":    8.0,
-            "CURVE_ENTRY": 4.5,
-            "CURVE":       2.8,
+            "STRAIGHT":    4.0,
+            "CURVE_ENTRY": 2.5,
+            "CURVE":       1.8,
         }
 
         #=============================================
@@ -401,6 +411,7 @@ class LidarConeController:
         right_arr = np.array([[c.x, c.y] for c in right_cones], dtype=np.float32)
 
         midpoints = []
+        widths = []
         x_centers = np.arange(
             self.X_BIN_MIN, self.X_BIN_MAX + 1e-6, self.X_BIN_STEP
         )
@@ -415,6 +426,16 @@ class LidarConeController:
             if width < self.CONE_WIDTH_MIN or width > self.CONE_WIDTH_MAX:
                 continue
             midpoints.append((float(x_c), 0.5 * (ly_med + ry_med)))
+            widths.append(width)
+
+        # 양쪽 페어가 1개 이상이면 lane half-width EMA 갱신
+        if len(widths) >= 1:
+            current_half = float(np.median(widths)) * 0.5
+            a = self.LANE_WIDTH_EMA_ALPHA
+            self._lane_half_width_est = (
+                a * current_half + (1.0 - a) * self._lane_half_width_est
+            )
+
         return midpoints
 
     #=============================================
@@ -499,11 +520,17 @@ class LidarConeController:
 
         use_left = len(left_cones) >= len(right_cones)
         if use_left and len(left_cones) > 0:
-            y = self._single_side_target_y(left_cones, sign=+1.0, lookahead=target_x_lookahead)
-            src = f"left_only_cones n={len(left_cones)}"
+            y, closest_r, boost = self._single_side_target_y(
+                left_cones, sign=+1.0
+            )
+            src = (f"left_only_avoid n={len(left_cones)} "
+                   f"r={closest_r:.2f} boost={boost:.2f}")
         elif len(right_cones) > 0:
-            y = self._single_side_target_y(right_cones, sign=-1.0, lookahead=target_x_lookahead)
-            src = f"right_only_cones n={len(right_cones)}"
+            y, closest_r, boost = self._single_side_target_y(
+                right_cones, sign=-1.0
+            )
+            src = (f"right_only_avoid n={len(right_cones)} "
+                   f"r={closest_r:.2f} boost={boost:.2f}")
         else:
             return None, "no_cones"
 
@@ -513,13 +540,36 @@ class LidarConeController:
         y = float(np.mean(self._lidar_target_y_history))
         return ((float(target_x_lookahead), float(y)), src)
 
-    def _single_side_target_y(self, cones, sign, lookahead):
-        """한쪽 라바콘만 보일 때 통로 절반폭만큼 안쪽으로 평행이동."""
-        arr = np.array([[c.x, c.y] for c in cones], dtype=np.float32)
-        order = np.argsort(np.abs(arr[:, 0] - lookahead))
-        arr = arr[order]
-        near = arr[:min(self.SIDE_SELECT_N, len(arr))]
-        return float(np.median(near[:, 1]) + sign * self.CONE_LANE_HALF_WIDTH)
+    def _single_side_target_y(self, cones, sign):
+        """한쪽 라바콘만 보일 때:
+        가장 가까운 라바콘을 기준으로 동적 lane half-width 만큼 반대쪽으로 target 설정.
+        가까울수록 부스트를 적용해 회피 강도 ↑.
+
+        sign = +1.0 : 왼쪽만 보임 (target은 오른쪽 = +y 방향)
+        sign = -1.0 : 오른쪽만 보임 (target은 왼쪽 = -y 방향)
+
+        반환: (target_y, closest_range, boost)
+        """
+        arr = np.array(
+            [[c.x, c.y, c.range] for c in cones], dtype=np.float32
+        )
+        # range 기준 가장 가까운 라바콘
+        closest_idx = int(np.argmin(arr[:, 2]))
+        closest_y = float(arr[closest_idx, 1])
+        closest_r = float(arr[closest_idx, 2])
+
+        # 거리 비례 회피 부스트
+        thr = self.SINGLE_SIDE_AVOID_THRESHOLD
+        if closest_r < thr:
+            ratio = max(0.0, 1.0 - closest_r / thr)
+            boost = 1.0 + ratio * (self.SINGLE_SIDE_AVOID_MAX_BOOST - 1.0)
+        else:
+            boost = 1.0
+
+        # 반대쪽 라바콘이 있다고 가정한 위치
+        # = 가까운 라바콘 y 좌표 + 반대 방향 (sign) × half_width × boost
+        target_y = closest_y + sign * self._lane_half_width_est * boost
+        return float(target_y), closest_r, float(boost)
 
     #=============================================
     # [7] 조향각 산출 (모드별 게인)
@@ -693,6 +743,12 @@ class LidarConeController:
             f"dist={self.MIN_CONE_DIST:.2f}-{self.MAX_CONE_DIST:.1f}m  "
             f"startup={startup_frame_count} seen_both={self._seen_both_sides_once}",
             (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
+        )
+        cv2.putText(
+            img,
+            f"lane_half_est={self._lane_half_width_est:.2f}m "
+            f"(track ~{2.0 * self._lane_half_width_est:.2f}m)",
+            (10, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1
         )
         cv2.putText(
             img,
