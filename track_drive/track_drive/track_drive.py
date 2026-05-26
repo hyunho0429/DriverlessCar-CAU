@@ -129,6 +129,11 @@ class TrackDriverNode(Node):
         self.USE_LIDAR_CONE_DRIVE = True
         self.lidar_cone_controller = LidarConeController()
 
+        # 라이다 컨트롤러에 넘겨줄 시작 이후 프레임 카운트
+        # 원래 track_drive.py 안에 있던 상태값인데, 모듈 분리 과정에서 빠지면
+        # _process()에서 AttributeError가 발생한다.
+        self._startup_frame_count = 0
+
         #=============================================
         # Internal state
         #=============================================
