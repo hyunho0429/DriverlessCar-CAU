@@ -269,9 +269,11 @@ class TrackDriverNode(Node):
 
             if not lidar_result["valid"]:
                 self.get_logger().info(
-                    f"[LIDAR WAIT {lidar_result['source']}] "
-                    f"pts={lidar_result['num_points']} "
-                    f"L={lidar_result['num_left']} R={lidar_result['num_right']} "
+                    f"[LIDAR WAIT {lidar_result.get('mode', '?')}] "
+                    f"{lidar_result['source']} "
+                    f"cones=L{lidar_result.get('num_cones_left', 0)}"
+                    f"/R{lidar_result.get('num_cones_right', 0)} "
+                    f"std={lidar_result.get('target_y_std', 0.0):.3f} "
                     f"startup={self._startup_frame_count}"
                 )
 
@@ -286,11 +288,13 @@ class TrackDriverNode(Node):
                 self._prev_speed = speed
 
                 self.get_logger().info(
-                    f"[LIDAR SPARSE {lidar_result['source']}] "
+                    f"[LIDAR {lidar_result.get('mode', '?')}] "
+                    f"{lidar_result['source']} "
                     f"angle={angle:+.1f} speed={speed:.1f} "
                     f"target=({target[0]:.2f},{target[1]:+.2f}) "
-                    f"pts={lidar_result['num_points']} "
-                    f"L={lidar_result['num_left']} R={lidar_result['num_right']} "
+                    f"cones=L{lidar_result.get('num_cones_left', 0)}"
+                    f"/R{lidar_result.get('num_cones_right', 0)} "
+                    f"std={lidar_result.get('target_y_std', 0.0):.3f} "
                     f"valid_cnt={lidar_result['valid_cnt']}"
                 )
 

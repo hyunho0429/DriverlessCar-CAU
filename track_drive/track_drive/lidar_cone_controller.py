@@ -1,59 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #=============================================
-# Lidar cone controller module
+# Lidar cone controller module (v2 — clustering + mode-aware control)
 #
-# track_drive.py에서 라바콘/라이다 주행 관련 로직을 분리한 파일.
-# - /scan LaserScan -> 전방 ROI 점 필터링
-# - 좌/우 라바콘 후보 분리
-# - sparse midpoint target 생성
-# - target -> steering/speed 계산
-# - lidar_cones debug image 생성
+# 파이프라인:
+#   /scan
+#     -> [1] _filter_lidar_points   거리/각도/ROI 필터
+#     -> [2] _cluster_cones         인접 점을 라바콘 객체로 묶음
+#     -> [3] _split_left_right_cones  좌/우 라바콘 분리
+#     -> [4] _x_binned_midpoints    bin별 좌/우 페어링 -> 통로 중점
+#     -> [5] _detect_mode           std(midpoint y) 로 STRAIGHT/CURVE 판정
+#     -> [6] _select_target_by_mode 모드별 lookahead로 target 결정
+#     -> [7] _compute_steering_by_mode 모드별 게인으로 angle 산출
+#     -> [8] _compute_speed_by_mode 모드별 속도 결정
 #=============================================
 
 import cv2
 import math
 import numpy as np
-from collections import deque
+from collections import deque, namedtuple
+
+
+# 클러스터링 결과로 만들어지는 라바콘 1개
+# x, y: 차량 기준 좌표 [m]
+# n_points: 이 라바콘에 속한 라이다 점 개수
+# range: 차량으로부터의 거리 (점들의 평균) [m]
+Cone = namedtuple("Cone", ["x", "y", "n_points", "range"])
 
 
 class LidarConeController:
 
     def __init__(self):
         #=============================================
-        # Lidar sparse midpoint cone following settings
+        # [1] 점 필터링 파라미터
         #=============================================
-        # 가까운 라바콘도 잡되, 0.12m 같은 차체 반사는 제거
-        self.MIN_CONE_DIST = 0.0
+        # 차체 반사(인덱스 114~246에서 약 0.12m)를 완전히 제외하려면
+        # MIN_CONE_DIST 가 0.30 이상이어야 안전하다.
+        self.MIN_CONE_DIST = 0.35
         self.MAX_CONE_DIST = 8.0
 
-        # 전방 + 측전방까지 넓게 사용
+        # 차체에 가려지지 않는 시야: 인덱스 247~113 (총 226도)
+        # 정규화 후 |deg| < 115도가 정확히 이 시야와 일치.
         self.FRONT_ANGLE_LIMIT = 115.0
 
         # 차량 좌표계 ROI
-        # x: 차량 전방
-        # y: 라이다 좌우 방향
-        #
-        # 현재 시뮬레이터 기준:
-        # y < 0 : 실제 왼쪽 라바콘
-        # y > 0 : 실제 오른쪽 라바콘
+        # x: 전방, y: 좌우 (sim 기준 y<0 이 실제 왼쪽)
         self.X_MIN = 0.20
         self.X_MAX = 7.0
         self.Y_LIMIT = 3.5
 
-        # 정면 근처 점도 너무 많이 버리지 않도록 완화
+        # 정면 정중앙은 좌/우 판별이 애매하므로 제외
         self.CENTER_Y_IGNORE = 0.05
 
         #=============================================
-        # 곡선 대응용 lookahead
+        # [2] 라바콘 클러스터링 파라미터
         #=============================================
-        # 기존 2.2는 곡선에서 너무 멀어서 직진처럼 보일 수 있음.
-        self.LOOKAHEAD_X = 1.30
-        self.LOOKAHEAD_WINDOW = 1.6
-        self.SIDE_SELECT_N = 4
+        # 1.3m 거리의 라바콘은 약 8개 점에 걸쳐 잡힘.
+        # 인접 점이 다음을 모두 만족하면 같은 라바콘으로 묶는다.
+        self.CLUSTER_ANGLE_GAP = 3.0   # 각도 차 임계 [deg]
+        self.CLUSTER_RANGE_GAP = 0.30  # 거리 차 임계 [m]
+        self.CLUSTER_MIN_POINTS = 2    # 라바콘 인정 최소 점 개수
 
-        # x-binned pairing: 곡선에서 좌/우 라바콘이 서로 다른 x에 있을 때
-        # 같은 x 구간에 들어온 점끼리만 짝지어 통로 중점을 만든다.
+        #=============================================
+        # [4] x-binned pairing 파라미터
+        #=============================================
+        # 같은 x 구간에 들어온 좌/우 라바콘 짝을 찾아 통로 중점 산출.
         self.X_BIN_MIN = 0.4
         self.X_BIN_MAX = 2.4
         self.X_BIN_STEP = 0.4
@@ -63,75 +74,100 @@ class LidarConeController:
         self.CONE_WIDTH_MIN = 0.30
         self.CONE_WIDTH_MAX = 6.0
 
-        # 곡선에서는 한쪽 라바콘만 보이는 순간이 있으므로 허용
+        # 한쪽만 보일 때 폴백 허용 (곡선에서 흔함)
         self.ALLOW_SINGLE_SIDE_PATH = True
         self.CONE_LANE_HALF_WIDTH = 0.68
 
+        # single-side 폴백에서 사용하는 점 개수
+        self.SIDE_SELECT_N = 4
+
         #=============================================
-        # Start straight fallback target
+        # [5] 모드 판정 파라미터
         #=============================================
-        # 시작 직후만 짧게 직진 보조.
-        # 좌우 라바콘이 한 번이라도 동시에 잡히면 이후에는 꺼짐.
+        # midpoint y의 표준편차로 직선/곡선 판정
+        # 9Hz x 3프레임 = 약 0.34초 안에 모드 확정
+        self.MODE_STD_STRAIGHT = 0.10  # std < 0.10 -> STRAIGHT
+        self.MODE_STD_CURVE = 0.25     # std < 0.25 -> CURVE_ENTRY, 이상 -> CURVE
+        self.MODE_CONFIRM_FRAMES = 3
+        self._current_mode = "STRAIGHT"
+        self._mode_candidate = "STRAIGHT"
+        self._mode_confirm_count = 0
+
+        #=============================================
+        # [6] 모드별 lookahead [m]
+        #=============================================
+        self.LOOKAHEAD_BY_MODE = {
+            "STRAIGHT":    1.50,
+            "CURVE_ENTRY": 1.10,
+            "CURVE":       0.85,
+        }
+
+        #=============================================
+        # [7] 모드별 조향 게인
+        # (kp_linear, kq_nonlinear, target_y_gain)
+        #=============================================
+        self.STEER_GAINS_BY_MODE = {
+            "STRAIGHT":    (2.8, 0.04, 1.4),
+            "CURVE_ENTRY": (3.8, 0.08, 1.6),
+            "CURVE":       (4.5, 0.12, 1.8),
+        }
+
+        #=============================================
+        # [8] 모드별 속도 [m/s]
+        #=============================================
+        self.SPEED_BY_MODE = {
+            "STRAIGHT":    8.0,
+            "CURVE_ENTRY": 4.5,
+            "CURVE":       2.8,
+        }
+
+        #=============================================
+        # 조향 공통: deadband, clip, rate limit
+        #=============================================
+        self.LIDAR_TARGET_Y_DEADBAND = 0.03
+        self.LIDAR_ANGLE_DEADBAND = 0.0
+        self.LIDAR_MAX_STEER = 60.0
+
+        # rate limit: 한 프레임에 최대 변할 수 있는 angle [deg]
+        # 9Hz 기준 35deg/frame = 약 315 deg/s
+        self.max_angle_step_s_curve = 35.0
+
+        # target_y < 0 일 때 차가 반대로 꺾으면 +1.0으로 뒤집기
+        self.LIDAR_STEER_SIGN = -1.0
+
+        #=============================================
+        # Startup 직진 폴백 (시작 직후 한 번 동안만)
+        #=============================================
         self.ALLOW_START_STRAIGHT_TARGET = True
         self.START_STRAIGHT_FRAMES = 25
         self.START_STRAIGHT_MIN_POINTS = 1
         self._seen_both_sides_once = False
 
-        # 라이다 valid 확인
+        #=============================================
+        # 라이다 valid 게이팅
+        #=============================================
         self.LIDAR_CONFIRM_FRAMES = 2
         self._lidar_valid_count = 0
 
         #=============================================
-        # 곡선 조향을 죽이지 않도록 deadband 축소
+        # smoothing 상태
         #=============================================
-        self.LIDAR_TARGET_Y_DEADBAND = 0.03
-        self.LIDAR_ANGLE_DEADBAND = 0.0
-
-        #=============================================
-        # Steering rate limit
-        #=============================================
-        self.max_angle_step_s_curve = 35.0
-
-        #=============================================
-        # 라이다 조향
-        #=============================================
-        # target_y < 0 : 실제 왼쪽 target
-        # target_y > 0 : 실제 오른쪽 target
-        # target 위치는 맞는데 차가 반대로 꺾으면 이 값을 +1.0으로 바꿔.
-        self.LIDAR_STEER_SIGN = -1.0
-        self.LIDAR_STEER_GAIN = 3.5
-        self.LIDAR_TARGET_Y_GAIN = 1.65
-        self.LIDAR_STEER_NONLINEAR_GAIN = 0.065
-        self.LIDAR_MAX_STEER = 60.0
-
-        # 라이다 주행 속도
-        self.LIDAR_STRAIGHT_SPEED = 8.0
-        self.LIDAR_CURVE_SPEED = 3.0
-        self.LIDAR_HARD_CURVE_SPEED = 2.5
-
-        # 라이다 smoothing 상태
         self._lidar_angle_history = deque(maxlen=1)
         self._lidar_target_y_history = deque(maxlen=2)
         self._prev_lidar_angle = 0.0
 
         #=============================================
-        # Lidar debug view
+        # debug
         #=============================================
-        # False:
-        #   현재 y<0이 실제 왼쪽이면 화면 왼쪽에도 초록색이 나오도록 표시.
-        # True:
-        #   디버그 화면만 좌우 반전.
-        #
-        # 주행 로직에는 영향 없음.
+        # True: 디버그 화면만 좌우 반전 (주행 로직 무관)
         self.LIDAR_DEBUG_FLIP_X = False
-
         self.debug_image = None
 
     #=============================================
     # Public API
     #=============================================
     def compute_control(self, scan_msg, startup_frame_count):
-        """LaserScan을 받아 라바콘 주행 angle/speed/debug 정보를 반환한다."""
+        """LaserScan을 받아 라바콘 주행 angle/speed/debug 정보를 반환."""
 
         result = {
             "valid": False,
@@ -140,9 +176,13 @@ class LidarConeController:
             "speed": 0.0,
             "target": None,
             "source": "none",
+            "mode": self._current_mode,
             "num_points": 0,
             "num_left": 0,
             "num_right": 0,
+            "num_cones_left": 0,
+            "num_cones_right": 0,
+            "target_y_std": 0.0,
             "valid_cnt": self._lidar_valid_count,
             "left_points": [],
             "right_points": [],
@@ -154,30 +194,57 @@ class LidarConeController:
             result["valid_cnt"] = self._lidar_valid_count
             return result
 
+        # [1] 점 필터링
         points = self._filter_lidar_points(scan_msg)
-        left_points, right_points = self._split_left_right_cones(points)
 
-        target, source = self._make_sparse_midpoint_target(
-            left_points=left_points,
-            right_points=right_points,
-            startup_frame_count=startup_frame_count
-        )
+        # [2] 라바콘 클러스터링
+        cones = self._cluster_cones(points)
 
+        # [3] 좌/우 분리
+        left_cones, right_cones = self._split_left_right_cones(cones)
+
+        # [4] x-bin pairing -> midpoints
+        midpoints = self._x_binned_midpoints(left_cones, right_cones)
+
+        # [5] 모드 판정
+        target_y_std = self._compute_target_y_std(midpoints)
+        mode = self._detect_mode(midpoints, target_y_std)
+
+        # 결과 기본 채우기 (target 만들기 전이라도 디버그용)
+        # 좌/우 분리에 사용된 raw 점은 디버그 용도로만 별도 유지
+        left_points, right_points = self._split_left_right_points(points)
         result["num_points"] = len(points)
         result["num_left"] = len(left_points)
         result["num_right"] = len(right_points)
-        result["target"] = target
-        result["source"] = source
+        result["num_cones_left"] = len(left_cones)
+        result["num_cones_right"] = len(right_cones)
         result["left_points"] = left_points
         result["right_points"] = right_points
+        result["target_y_std"] = float(target_y_std)
+        result["mode"] = mode
 
+        # [6] target 결정 (모드별 lookahead)
+        target, source = self._select_target_by_mode(
+            mode=mode,
+            midpoints=midpoints,
+            left_cones=left_cones,
+            right_cones=right_cones,
+            startup_frame_count=startup_frame_count,
+        )
+        result["target"] = target
+        result["source"] = source
+
+        # 디버그 이미지는 항상 그림
         self._draw_lidar_debug(
             points=points,
-            left_points=left_points,
-            right_points=right_points,
+            left_cones=left_cones,
+            right_cones=right_cones,
+            midpoints=midpoints,
             target=target,
             source=source,
-            startup_frame_count=startup_frame_count
+            mode=mode,
+            target_y_std=target_y_std,
+            startup_frame_count=startup_frame_count,
         )
         result["debug_image"] = self.debug_image
 
@@ -196,69 +263,19 @@ class LidarConeController:
         if abs(target_y) < self.LIDAR_TARGET_Y_DEADBAND:
             target_y = 0.0
 
-        # target_y < 0: 실제 왼쪽
-        # target_y > 0: 실제 오른쪽
-        #
-        # 조향이 약하게 나오는 문제 대응:
-        # 1) target_y 자체를 증폭해서 가까운 S자 곡선에 더 민감하게 반응
-        # 2) heading이 커질수록 nonlinear 항을 추가해서 급커브에서 더 강하게 조향
-        control_y = target_y * self.LIDAR_TARGET_Y_GAIN
-
-        target_heading_deg = math.degrees(
-            math.atan2(control_y, target_x)
+        # [7] 조향각 산출
+        angle_cmd = self._compute_steering_by_mode(
+            mode=mode, target_x=target_x, target_y=target_y
         )
 
-        angle_linear = self.LIDAR_STEER_GAIN * target_heading_deg
-        angle_nonlinear = (
-            self.LIDAR_STEER_NONLINEAR_GAIN
-            * target_heading_deg
-            * abs(target_heading_deg)
-        )
+        # [8] 속도 산출
+        speed = self._compute_speed_by_mode(mode=mode)
 
-        angle_raw = self.LIDAR_STEER_SIGN * (
-            angle_linear + angle_nonlinear
-        )
-
-        angle_raw = float(
-            np.clip(
-                angle_raw,
-                -self.LIDAR_MAX_STEER,
-                self.LIDAR_MAX_STEER
-            )
-        )
-
-        if abs(angle_raw) < self.LIDAR_ANGLE_DEADBAND:
-            angle_raw = 0.0
-
-        self._lidar_angle_history.append(angle_raw)
-        angle_smooth = float(np.mean(self._lidar_angle_history))
-
-        angle_cmd = self._limit_lidar_angle_rate(
-            target_angle=angle_smooth
-        )
-
-        angle_cmd = float(
-            np.clip(
-                angle_cmd,
-                -self.LIDAR_MAX_STEER,
-                self.LIDAR_MAX_STEER
-            )
-        )
-
-        abs_angle = abs(angle_cmd)
-
-        if abs_angle < 10.0:
-            speed = self.LIDAR_STRAIGHT_SPEED
-        elif abs_angle < 25.0:
-            speed = self.LIDAR_CURVE_SPEED
-        else:
-            speed = self.LIDAR_HARD_CURVE_SPEED
-
+        # valid confirm 게이팅
         self._lidar_valid_count += 1
         confirmed = self._lidar_valid_count >= self.LIDAR_CONFIRM_FRAMES
 
-        # 기존 track_drive.py와 동일하게, 실제 라이다 주행이 적용되는 시점에
-        # 다음 rate limit 기준 조향각을 갱신한다.
+        # 라이다가 실제 주행에 반영되는 시점에만 rate limit 기준 갱신
         if confirmed:
             self._prev_lidar_angle = angle_cmd
 
@@ -272,7 +289,274 @@ class LidarConeController:
         return result
 
     #=============================================
-    # Internal helpers
+    # [1] 점 필터링
+    #=============================================
+    def _filter_lidar_points(self, scan_msg):
+        points = []
+        if scan_msg is None:
+            return points
+
+        for i, r in enumerate(scan_msg.ranges):
+            if not np.isfinite(r):
+                continue
+            if r < self.MIN_CONE_DIST or r > self.MAX_CONE_DIST:
+                continue
+
+            theta = scan_msg.angle_min + i * scan_msg.angle_increment
+            deg = self._normalize_deg(math.degrees(theta))
+
+            # 전방 + 측전방 시야만 (차체 가림 영역 제외)
+            if abs(deg) > self.FRONT_ANGLE_LIMIT:
+                continue
+
+            rad = math.radians(deg)
+            x = r * math.cos(rad)
+            y = r * math.sin(rad)
+
+            if x < self.X_MIN or x > self.X_MAX:
+                continue
+            if abs(y) > self.Y_LIMIT:
+                continue
+
+            points.append((x, y, r, deg))
+
+        return points
+
+    #=============================================
+    # [2] 라바콘 클러스터링
+    #=============================================
+    def _cluster_cones(self, points):
+        """인접한 점들을 묶어 개별 라바콘 객체 리스트로 변환.
+        각도 기준 정렬 후 1D 그리디 클러스터링."""
+        if len(points) == 0:
+            return []
+
+        # deg 기준 오름차순 정렬
+        sorted_pts = sorted(points, key=lambda p: p[3])
+
+        clusters = []
+        current = [sorted_pts[0]]
+
+        for prev, curr in zip(sorted_pts[:-1], sorted_pts[1:]):
+            d_deg = abs(curr[3] - prev[3])
+            d_range = abs(curr[2] - prev[2])
+            if d_deg < self.CLUSTER_ANGLE_GAP and d_range < self.CLUSTER_RANGE_GAP:
+                current.append(curr)
+            else:
+                clusters.append(current)
+                current = [curr]
+        clusters.append(current)
+
+        cones = []
+        for cl in clusters:
+            if len(cl) < self.CLUSTER_MIN_POINTS:
+                continue
+            xs = [p[0] for p in cl]
+            ys = [p[1] for p in cl]
+            rs = [p[2] for p in cl]
+            cones.append(Cone(
+                x=float(np.mean(xs)),
+                y=float(np.mean(ys)),
+                n_points=len(cl),
+                range=float(np.mean(rs)),
+            ))
+        return cones
+
+    #=============================================
+    # [3] 좌/우 분리 (클러스터 기준)
+    #=============================================
+    def _split_left_right_cones(self, cones):
+        left_cones, right_cones = [], []
+        for c in cones:
+            if abs(c.y) < self.CENTER_Y_IGNORE:
+                continue
+            if c.y < 0.0:
+                left_cones.append(c)
+            else:
+                right_cones.append(c)
+        return left_cones, right_cones
+
+    def _split_left_right_points(self, points):
+        """디버그/로깅용으로만 사용 (모드 판정/조향은 클러스터 기준)."""
+        left, right = [], []
+        for p in points:
+            if abs(p[1]) < self.CENTER_Y_IGNORE:
+                continue
+            if p[1] < 0.0:
+                left.append(p)
+            else:
+                right.append(p)
+        return left, right
+
+    #=============================================
+    # [4] x-binned pairing -> midpoints
+    #=============================================
+    def _x_binned_midpoints(self, left_cones, right_cones):
+        """각 x bin에서 좌/우 라바콘이 모두 있으면 (mid_x, mid_y) 추출.
+        width sanity 통과한 것만 반환."""
+        if len(left_cones) == 0 or len(right_cones) == 0:
+            return []
+
+        left_arr = np.array([[c.x, c.y] for c in left_cones], dtype=np.float32)
+        right_arr = np.array([[c.x, c.y] for c in right_cones], dtype=np.float32)
+
+        midpoints = []
+        x_centers = np.arange(
+            self.X_BIN_MIN, self.X_BIN_MAX + 1e-6, self.X_BIN_STEP
+        )
+        for x_c in x_centers:
+            L_mask = np.abs(left_arr[:, 0] - x_c) <= self.X_BIN_HALF
+            R_mask = np.abs(right_arr[:, 0] - x_c) <= self.X_BIN_HALF
+            if not L_mask.any() or not R_mask.any():
+                continue
+            ly_med = float(np.median(left_arr[L_mask, 1]))
+            ry_med = float(np.median(right_arr[R_mask, 1]))
+            width = abs(ry_med - ly_med)
+            if width < self.CONE_WIDTH_MIN or width > self.CONE_WIDTH_MAX:
+                continue
+            midpoints.append((float(x_c), 0.5 * (ly_med + ry_med)))
+        return midpoints
+
+    #=============================================
+    # [5] 모드 판정 (std + 히스테리시스)
+    #=============================================
+    def _compute_target_y_std(self, midpoints):
+        if len(midpoints) < 2:
+            return 0.0
+        ys = np.array([m[1] for m in midpoints], dtype=np.float32)
+        return float(np.std(ys))
+
+    def _detect_mode(self, midpoints, target_y_std):
+        # bin이 부족하면 모드 유지 (깜빡임 방지)
+        if len(midpoints) < 2:
+            return self._current_mode
+
+        if target_y_std < self.MODE_STD_STRAIGHT:
+            raw_mode = "STRAIGHT"
+        elif target_y_std < self.MODE_STD_CURVE:
+            raw_mode = "CURVE_ENTRY"
+        else:
+            raw_mode = "CURVE"
+
+        if raw_mode == self._current_mode:
+            self._mode_candidate = raw_mode
+            self._mode_confirm_count = 0
+            return self._current_mode
+
+        # 다른 모드 후보 등장
+        if self._mode_candidate != raw_mode:
+            self._mode_candidate = raw_mode
+            self._mode_confirm_count = 1
+            return self._current_mode
+
+        self._mode_confirm_count += 1
+        if self._mode_confirm_count >= self.MODE_CONFIRM_FRAMES:
+            self._current_mode = raw_mode
+            self._mode_confirm_count = 0
+        return self._current_mode
+
+    #=============================================
+    # [6] target 결정 (모드별 lookahead)
+    #=============================================
+    def _select_target_by_mode(self, mode, midpoints, left_cones, right_cones, startup_frame_count):
+        target_x_lookahead = self.LOOKAHEAD_BY_MODE[mode]
+
+        # midpoint가 충분히 있으면 가중평균
+        if len(midpoints) > 0:
+            self._seen_both_sides_once = True
+            arr = np.array(midpoints, dtype=np.float32)
+            weights = 1.0 / (np.abs(arr[:, 0] - target_x_lookahead) + 0.3)
+            target_y = float(np.average(arr[:, 1], weights=weights))
+
+            if abs(target_y) < self.LIDAR_TARGET_Y_DEADBAND:
+                target_y = 0.0
+            self._lidar_target_y_history.append(target_y)
+            target_y = float(np.mean(self._lidar_target_y_history))
+
+            return (
+                (float(target_x_lookahead), float(target_y)),
+                f"binned_midpoint n={len(midpoints)} mode={mode}"
+            )
+
+        # midpoint 없음 — startup 직진 폴백
+        total_cones = len(left_cones) + len(right_cones)
+        if (
+            self.ALLOW_START_STRAIGHT_TARGET
+            and not self._seen_both_sides_once
+            and startup_frame_count <= self.START_STRAIGHT_FRAMES
+            and total_cones >= self.START_STRAIGHT_MIN_POINTS
+        ):
+            return (
+                (float(target_x_lookahead), 0.0),
+                f"startup_straight L{len(left_cones)} R{len(right_cones)}"
+            )
+
+        # single-side 폴백
+        if not self.ALLOW_SINGLE_SIDE_PATH:
+            return None, f"need_both_sides L{len(left_cones)} R{len(right_cones)}"
+        if len(left_cones) == 0 and len(right_cones) == 0:
+            return None, "no_cones"
+
+        use_left = len(left_cones) >= len(right_cones)
+        if use_left and len(left_cones) > 0:
+            y = self._single_side_target_y(left_cones, sign=+1.0, lookahead=target_x_lookahead)
+            src = f"left_only_cones n={len(left_cones)}"
+        elif len(right_cones) > 0:
+            y = self._single_side_target_y(right_cones, sign=-1.0, lookahead=target_x_lookahead)
+            src = f"right_only_cones n={len(right_cones)}"
+        else:
+            return None, "no_cones"
+
+        if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
+            y = 0.0
+        self._lidar_target_y_history.append(y)
+        y = float(np.mean(self._lidar_target_y_history))
+        return ((float(target_x_lookahead), float(y)), src)
+
+    def _single_side_target_y(self, cones, sign, lookahead):
+        """한쪽 라바콘만 보일 때 통로 절반폭만큼 안쪽으로 평행이동."""
+        arr = np.array([[c.x, c.y] for c in cones], dtype=np.float32)
+        order = np.argsort(np.abs(arr[:, 0] - lookahead))
+        arr = arr[order]
+        near = arr[:min(self.SIDE_SELECT_N, len(arr))]
+        return float(np.median(near[:, 1]) + sign * self.CONE_LANE_HALF_WIDTH)
+
+    #=============================================
+    # [7] 조향각 산출 (모드별 게인)
+    #=============================================
+    def _compute_steering_by_mode(self, mode, target_x, target_y):
+        kp, kq, y_gain = self.STEER_GAINS_BY_MODE[mode]
+
+        control_y = target_y * y_gain
+        heading_deg = math.degrees(math.atan2(control_y, target_x))
+
+        angle_linear = kp * heading_deg
+        angle_nonlinear = kq * heading_deg * abs(heading_deg)
+        angle_raw = self.LIDAR_STEER_SIGN * (angle_linear + angle_nonlinear)
+        angle_raw = float(np.clip(
+            angle_raw, -self.LIDAR_MAX_STEER, self.LIDAR_MAX_STEER
+        ))
+
+        if abs(angle_raw) < self.LIDAR_ANGLE_DEADBAND:
+            angle_raw = 0.0
+
+        self._lidar_angle_history.append(angle_raw)
+        angle_smooth = float(np.mean(self._lidar_angle_history))
+
+        angle_cmd = self._limit_lidar_angle_rate(angle_smooth)
+        angle_cmd = float(np.clip(
+            angle_cmd, -self.LIDAR_MAX_STEER, self.LIDAR_MAX_STEER
+        ))
+        return angle_cmd
+
+    #=============================================
+    # [8] 속도 결정 (모드별)
+    #=============================================
+    def _compute_speed_by_mode(self, mode):
+        return float(self.SPEED_BY_MODE[mode])
+
+    #=============================================
+    # 공통 헬퍼
     #=============================================
     def _reset_on_invalid(self):
         self._lidar_valid_count = 0
@@ -283,377 +567,138 @@ class LidarConeController:
     def _limit_lidar_angle_rate(self, target_angle):
         max_step = self.max_angle_step_s_curve
         diff = target_angle - self._prev_lidar_angle
-
         if diff > max_step:
             diff = max_step
         elif diff < -max_step:
             diff = -max_step
-
         return float(self._prev_lidar_angle + diff)
 
     @staticmethod
     def _normalize_deg(deg):
         deg = deg % 360.0
-
         if deg > 180.0:
             deg -= 360.0
-
         return deg
 
     #=============================================
-    # /scan -> 전방 ROI 라이다 점 필터링
+    # 디버그 top-view
     #=============================================
-    def _filter_lidar_points(self, scan_msg):
-        points = []
-
-        if scan_msg is None:
-            return points
-
-        for i, r in enumerate(scan_msg.ranges):
-
-            if not np.isfinite(r):
-                continue
-
-            # 너무 가까운 차체 반사/너무 먼 배경 제거
-            if r < self.MIN_CONE_DIST or r > self.MAX_CONE_DIST:
-                continue
-
-            theta = scan_msg.angle_min + i * scan_msg.angle_increment
-            deg = self._normalize_deg(math.degrees(theta))
-
-            # 전방 + 측전방 범위만 사용
-            if abs(deg) > self.FRONT_ANGLE_LIMIT:
-                continue
-
-            rad = math.radians(deg)
-
-            # 차량 기준 좌표
-            # x: 전방
-            # y: 라이다 좌우 방향
-            #
-            # 현재 시뮬레이터에서는 y < 0이 실제 왼쪽으로 보임.
-            x = r * math.cos(rad)
-            y = r * math.sin(rad)
-
-            # 전방 ROI
-            if x < self.X_MIN or x > self.X_MAX:
-                continue
-
-            # 좌우 폭 ROI
-            if abs(y) > self.Y_LIMIT:
-                continue
-
-            points.append((x, y, r, deg))
-
-        return points
-
-    #=============================================
-    # 좌/우 라바콘 분리
-    #=============================================
-    def _split_left_right_cones(self, points):
-        left_points = []
-        right_points = []
-
-        for x, y, r, deg in points:
-
-            # 정면 근처는 좌우 판단이 애매하므로 제외
-            if abs(y) < self.CENTER_Y_IGNORE:
-                continue
-
-            # 현재 시뮬레이터 기준:
-            # y < 0 -> 실제 왼쪽 라바콘
-            # y > 0 -> 실제 오른쪽 라바콘
-            if y < 0.0:
-                left_points.append((x, y, r, deg))
-            else:
-                right_points.append((x, y, r, deg))
-
-        return left_points, right_points
-
-    #=============================================
-    # x-binned pairing: 같은 x 구간의 좌/우 점만 짝지어 통로 중점 추출
-    #=============================================
-    def _x_binned_midpoints(self, left_points, right_points):
-        """각 x bin에서 좌/우 점이 모두 있으면 (mid_x, mid_y)를 반환.
-        width sanity check 통과한 페어만 남김."""
-
-        if len(left_points) == 0 or len(right_points) == 0:
-            return []
-
-        left_arr = np.array(
-            [[p[0], p[1]] for p in left_points],
-            dtype=np.float32
-        )
-        right_arr = np.array(
-            [[p[0], p[1]] for p in right_points],
-            dtype=np.float32
-        )
-
-        midpoints = []
-        x_centers = np.arange(
-            self.X_BIN_MIN,
-            self.X_BIN_MAX + 1e-6,
-            self.X_BIN_STEP
-        )
-
-        for x_c in x_centers:
-            L_mask = np.abs(left_arr[:, 0] - x_c) <= self.X_BIN_HALF
-            R_mask = np.abs(right_arr[:, 0] - x_c) <= self.X_BIN_HALF
-
-            if not L_mask.any() or not R_mask.any():
-                continue
-
-            ly_med = float(np.median(left_arr[L_mask, 1]))
-            ry_med = float(np.median(right_arr[R_mask, 1]))
-
-            width = abs(ry_med - ly_med)
-
-            # bin 단위 폭 체크 — 곡선에서 비대칭이어도 각 bin은 정상 폭이어야 함
-            if width < self.CONE_WIDTH_MIN or width > self.CONE_WIDTH_MAX:
-                continue
-
-            midpoints.append((float(x_c), 0.5 * (ly_med + ry_med)))
-
-        return midpoints
-
-    #=============================================
-    # 한쪽 라바콘만 보일 때 target 추정
-    #=============================================
-    def _single_side_target_y(self, side_points, sign):
-        """sign=+1: 왼쪽만 보임(y<0) → 중앙으로 +half_width
-        sign=-1: 오른쪽만 보임(y>0) → 중앙으로 -half_width
-        가까운 점 N개의 median을 사용해 진동 억제."""
-
-        arr = np.array(
-            [[p[0], p[1]] for p in side_points],
-            dtype=np.float32
-        )
-
-        order = np.argsort(np.abs(arr[:, 0] - self.LOOKAHEAD_X))
-        arr = arr[order]
-        near = arr[:min(self.SIDE_SELECT_N, len(arr))]
-
-        return float(np.median(near[:, 1]) + sign * self.CONE_LANE_HALF_WIDTH)
-
-    #=============================================
-    # 희소 라이다 점 기반 중앙 target 생성 (x-binned pairing 기반)
-    #=============================================
-    def _make_sparse_midpoint_target(self, left_points, right_points, startup_frame_count):
-
-        #=============================================
-        # 1. x-binned pairing 우선 시도
-        #=============================================
-        midpoints = self._x_binned_midpoints(left_points, right_points)
-
-        if len(midpoints) > 0:
-            # 좌우가 동시에 한 번이라도 잡혔으므로 startup fallback 종료
-            self._seen_both_sides_once = True
-
-            arr = np.array(midpoints, dtype=np.float32)
-
-            # LOOKAHEAD_X에 가까운 bin에 더 큰 가중치 (역거리 가중치)
-            # +0.3은 lookahead 정확히 위에 있는 bin이 무한대 가중을 받지 않도록 하는 ε
-            weights = 1.0 / (np.abs(arr[:, 0] - self.LOOKAHEAD_X) + 0.3)
-            target_y = float(np.average(arr[:, 1], weights=weights))
-
-            # target_x는 고정 lookahead — 가까운 페어 때문에 atan2가 과도해지는 것 방지
-            target_x = self.LOOKAHEAD_X
-
-            if abs(target_y) < self.LIDAR_TARGET_Y_DEADBAND:
-                target_y = 0.0
-
-            self._lidar_target_y_history.append(target_y)
-            target_y = float(np.mean(self._lidar_target_y_history))
-
-            return (
-                (float(target_x), float(target_y)),
-                f"binned_midpoint n={len(midpoints)}"
-            )
-
-        #=============================================
-        # 2. 페어링 실패 — 시작 직후라면 직진 fallback
-        #=============================================
-        total_points = len(left_points) + len(right_points)
-
-        if (
-            self.ALLOW_START_STRAIGHT_TARGET
-            and not self._seen_both_sides_once
-            and startup_frame_count <= self.START_STRAIGHT_FRAMES
-            and total_points >= self.START_STRAIGHT_MIN_POINTS
-        ):
-            return (
-                (float(self.LOOKAHEAD_X), 0.0),
-                f"startup_straight L{len(left_points)} R{len(right_points)}"
-            )
-
-        #=============================================
-        # 3. 페어링 실패 — 단일 side 폴백
-        #    (양쪽 다 있어도 bin이 안 맞으면 점이 많은 쪽 사용)
-        #=============================================
-        if not self.ALLOW_SINGLE_SIDE_PATH:
-            return None, f"need_both_sides L{len(left_points)} R{len(right_points)}"
-
-        if len(left_points) == 0 and len(right_points) == 0:
-            return None, "no_points"
-
-        # 더 풍부한 쪽을 신뢰 (곡선에서는 안쪽 라바콘이 더 많이 잡히는 경향)
-        use_left = len(left_points) >= len(right_points)
-
-        if use_left and len(left_points) > 0:
-            y = self._single_side_target_y(left_points, sign=+1.0)
-            src = "left_only_sparse"
-        elif len(right_points) > 0:
-            y = self._single_side_target_y(right_points, sign=-1.0)
-            src = "right_only_sparse"
-        else:
-            return None, "no_points"
-
-        if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
-            y = 0.0
-
-        self._lidar_target_y_history.append(y)
-        y = float(np.mean(self._lidar_target_y_history))
-
-        return (
-            (float(self.LOOKAHEAD_X), float(y)),
-            src
-        )
-
-    #=============================================
-    # 라이다 디버그 top-view 이미지
-    #=============================================
-    def _draw_lidar_debug(self, points, left_points, right_points, target, source="none", startup_frame_count=0):
-        width = 500
-        height = 500
+    def _draw_lidar_debug(self, points, left_cones, right_cones,
+                          midpoints, target, source, mode,
+                          target_y_std, startup_frame_count):
+        width = 540
+        height = 540
         scale = 65.0
-
         img = np.zeros((height, width, 3), dtype=np.uint8)
 
         origin_x = width // 2
         origin_y = height - 40
 
+        # ROI 박스
         x_min_px = int(origin_y - self.X_MIN * scale)
         x_max_px = int(origin_y - self.X_MAX * scale)
-
         if self.LIDAR_DEBUG_FLIP_X:
             y_left_px = int(origin_x + self.Y_LIMIT * scale)
             y_right_px = int(origin_x - self.Y_LIMIT * scale)
         else:
             y_left_px = int(origin_x - self.Y_LIMIT * scale)
             y_right_px = int(origin_x + self.Y_LIMIT * scale)
-
         cv2.rectangle(
             img,
             (min(y_left_px, y_right_px), x_max_px),
             (max(y_left_px, y_right_px), x_min_px),
-            (60, 60, 60),
-            1
+            (60, 60, 60), 1
         )
 
-        # 차량 위치 및 진행 방향
-        cv2.circle(
-            img,
-            (origin_x, origin_y),
-            6,
-            (255, 255, 255),
-            -1
-        )
-
+        # 차량 위치 + 진행 방향 화살표
+        cv2.circle(img, (origin_x, origin_y), 6, (255, 255, 255), -1)
         cv2.arrowedLine(
-            img,
-            (origin_x, origin_y),
-            (origin_x, origin_y - 45),
-            (255, 255, 255),
-            2
+            img, (origin_x, origin_y),
+            (origin_x, origin_y - 45), (255, 255, 255), 2
         )
 
         def to_pixel(x, y):
-            # 주행 로직의 y값은 그대로 두고, 디버그 화면만 좌우 반전 가능.
             if self.LIDAR_DEBUG_FLIP_X:
                 px = int(origin_x - y * scale)
             else:
                 px = int(origin_x + y * scale)
-
             py = int(origin_y - x * scale)
-
             return px, py
 
-        # 전체 후보 점: 회색
-        for x, y, r, deg in points:
-            px, py = to_pixel(x, y)
+        # 원본 점은 회색
+        for p in points:
+            px, py = to_pixel(p[0], p[1])
             cv2.circle(img, (px, py), 2, (80, 80, 80), -1)
 
-        # 왼쪽 후보: 초록색
-        for x, y, r, deg in left_points:
-            px, py = to_pixel(x, y)
-            cv2.circle(img, (px, py), 5, (0, 255, 0), -1)
+        # 클러스터 = 큰 동그라미. 좌 초록, 우 빨강.
+        def draw_cones(cones, color):
+            for c in cones:
+                px, py = to_pixel(c.x, c.y)
+                cv2.circle(img, (px, py), 9, color, 2)
+                cv2.putText(
+                    img, str(c.n_points),
+                    (px - 5, py + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
+                )
+        draw_cones(left_cones, (0, 255, 0))
+        draw_cones(right_cones, (0, 0, 255))
 
-        # 오른쪽 후보: 빨간색
-        for x, y, r, deg in right_points:
-            px, py = to_pixel(x, y)
-            cv2.circle(img, (px, py), 5, (0, 0, 255), -1)
+        # midpoints = 작은 노란 점
+        for (mx, my) in midpoints:
+            px, py = to_pixel(mx, my)
+            cv2.circle(img, (px, py), 4, (0, 255, 255), -1)
 
-        # lookahead x line
-        lx1, ly1 = to_pixel(self.LOOKAHEAD_X, -self.Y_LIMIT)
-        lx2, ly2 = to_pixel(self.LOOKAHEAD_X, self.Y_LIMIT)
-        cv2.line(img, (lx1, ly1), (lx2, ly2), (100, 100, 255), 1)
+        # 현재 모드의 lookahead 가로선
+        lookahead_x = self.LOOKAHEAD_BY_MODE.get(mode, 1.3)
+        lx1, ly1 = to_pixel(lookahead_x, -self.Y_LIMIT)
+        lx2, ly2 = to_pixel(lookahead_x, self.Y_LIMIT)
+        cv2.line(img, (lx1, ly1), (lx2, ly2), (180, 180, 255), 1)
 
-        # target: 파란색
+        # target = 파란 원 + 라인
         if target is not None:
             tx, ty = target
             px, py = to_pixel(tx, ty)
-
             cv2.circle(img, (px, py), 8, (255, 0, 0), -1)
             cv2.line(img, (origin_x, origin_y), (px, py), (255, 0, 0), 2)
 
+        # 모드 헤더 — 색상 mode별 다르게
+        mode_color = {
+            "STRAIGHT":    (0, 255, 0),
+            "CURVE_ENTRY": (0, 255, 255),
+            "CURVE":       (0, 0, 255),
+        }.get(mode, (255, 255, 255))
         cv2.putText(
-            img,
-            "Lidar sparse midpoint",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
+            img, f"MODE: {mode}",
+            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2
         )
 
+        # 보조 정보
         cv2.putText(
             img,
-            "green=left, red=right, blue=target",
-            (10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
+            f"std={target_y_std:.3f}  thr(S<{self.MODE_STD_STRAIGHT}|C<{self.MODE_STD_CURVE})",
+            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
         )
-
         cv2.putText(
             img,
-            f"dist={self.MIN_CONE_DIST:.2f}-{self.MAX_CONE_DIST:.1f}m angle=+-{self.FRONT_ANGLE_LIMIT:.0f}deg",
-            (10, 72),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
+            f"lookahead={lookahead_x:.2f}  source={source}",
+            (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
         )
-
         cv2.putText(
             img,
-            f"lookahead_x={self.LOOKAHEAD_X:.2f} window={self.LOOKAHEAD_WINDOW:.1f} flip={self.LIDAR_DEBUG_FLIP_X}",
-            (10, 94),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
+            f"cones L{len(left_cones)} R{len(right_cones)}  midpoints={len(midpoints)}",
+            (10, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
         )
-
         cv2.putText(
             img,
-            f"source={source} startup={startup_frame_count} seen_both={self._seen_both_sides_once}",
-            (10, 116),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
+            f"dist={self.MIN_CONE_DIST:.2f}-{self.MAX_CONE_DIST:.1f}m  "
+            f"startup={startup_frame_count} seen_both={self._seen_both_sides_once}",
+            (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
+        )
+        cv2.putText(
+            img,
+            "green=left cones, red=right cones, yellow=midpoints, blue=target",
+            (10, height - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1
         )
 
         self.debug_image = img
