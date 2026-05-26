@@ -52,7 +52,14 @@ class LidarConeController:
         self.LOOKAHEAD_WINDOW = 1.6
         self.SIDE_SELECT_N = 4
 
-        # 라바콘 통로 폭 sanity check
+        # x-binned pairing: 곡선에서 좌/우 라바콘이 서로 다른 x에 있을 때
+        # 같은 x 구간에 들어온 점끼리만 짝지어 통로 중점을 만든다.
+        self.X_BIN_MIN = 0.4
+        self.X_BIN_MAX = 2.4
+        self.X_BIN_STEP = 0.4
+        self.X_BIN_HALF = 0.30
+
+        # 라바콘 통로 폭 sanity check (bin별 페어에 적용)
         self.CONE_WIDTH_MIN = 0.30
         self.CONE_WIDTH_MAX = 6.0
 
@@ -364,162 +371,152 @@ class LidarConeController:
         return left_points, right_points
 
     #=============================================
-    # 희소 라이다 점 기반 중앙 target 생성
+    # x-binned pairing: 같은 x 구간의 좌/우 점만 짝지어 통로 중점 추출
+    #=============================================
+    def _x_binned_midpoints(self, left_points, right_points):
+        """각 x bin에서 좌/우 점이 모두 있으면 (mid_x, mid_y)를 반환.
+        width sanity check 통과한 페어만 남김."""
+
+        if len(left_points) == 0 or len(right_points) == 0:
+            return []
+
+        left_arr = np.array(
+            [[p[0], p[1]] for p in left_points],
+            dtype=np.float32
+        )
+        right_arr = np.array(
+            [[p[0], p[1]] for p in right_points],
+            dtype=np.float32
+        )
+
+        midpoints = []
+        x_centers = np.arange(
+            self.X_BIN_MIN,
+            self.X_BIN_MAX + 1e-6,
+            self.X_BIN_STEP
+        )
+
+        for x_c in x_centers:
+            L_mask = np.abs(left_arr[:, 0] - x_c) <= self.X_BIN_HALF
+            R_mask = np.abs(right_arr[:, 0] - x_c) <= self.X_BIN_HALF
+
+            if not L_mask.any() or not R_mask.any():
+                continue
+
+            ly_med = float(np.median(left_arr[L_mask, 1]))
+            ry_med = float(np.median(right_arr[R_mask, 1]))
+
+            width = abs(ry_med - ly_med)
+
+            # bin 단위 폭 체크 — 곡선에서 비대칭이어도 각 bin은 정상 폭이어야 함
+            if width < self.CONE_WIDTH_MIN or width > self.CONE_WIDTH_MAX:
+                continue
+
+            midpoints.append((float(x_c), 0.5 * (ly_med + ry_med)))
+
+        return midpoints
+
+    #=============================================
+    # 한쪽 라바콘만 보일 때 target 추정
+    #=============================================
+    def _single_side_target_y(self, side_points, sign):
+        """sign=+1: 왼쪽만 보임(y<0) → 중앙으로 +half_width
+        sign=-1: 오른쪽만 보임(y>0) → 중앙으로 -half_width
+        가까운 점 N개의 median을 사용해 진동 억제."""
+
+        arr = np.array(
+            [[p[0], p[1]] for p in side_points],
+            dtype=np.float32
+        )
+
+        order = np.argsort(np.abs(arr[:, 0] - self.LOOKAHEAD_X))
+        arr = arr[order]
+        near = arr[:min(self.SIDE_SELECT_N, len(arr))]
+
+        return float(np.median(near[:, 1]) + sign * self.CONE_LANE_HALF_WIDTH)
+
+    #=============================================
+    # 희소 라이다 점 기반 중앙 target 생성 (x-binned pairing 기반)
     #=============================================
     def _make_sparse_midpoint_target(self, left_points, right_points, startup_frame_count):
 
         #=============================================
-        # 좌우 중 하나라도 안 보이는 경우
+        # 1. x-binned pairing 우선 시도
         #=============================================
-        if len(left_points) == 0 or len(right_points) == 0:
+        midpoints = self._x_binned_midpoints(left_points, right_points)
 
-            total_points = len(left_points) + len(right_points)
+        if len(midpoints) > 0:
+            # 좌우가 동시에 한 번이라도 잡혔으므로 startup fallback 종료
+            self._seen_both_sides_once = True
 
-            # 시작 직후에는 임시 직진 target 생성
-            # 단, 좌우가 한 번이라도 동시에 잡힌 뒤에는 사용하지 않음
-            if (
-                self.ALLOW_START_STRAIGHT_TARGET
-                and not self._seen_both_sides_once
-                and startup_frame_count <= self.START_STRAIGHT_FRAMES
-                and total_points >= self.START_STRAIGHT_MIN_POINTS
-            ):
-                return (
-                    (float(self.LOOKAHEAD_X), 0.0),
-                    f"startup_straight L{len(left_points)} R{len(right_points)}"
-                )
+            arr = np.array(midpoints, dtype=np.float32)
 
-            # 한쪽만 쓰는 모드
-            if not self.ALLOW_SINGLE_SIDE_PATH:
-                return None, f"need_both_sides L{len(left_points)} R{len(right_points)}"
+            # LOOKAHEAD_X에 가까운 bin에 더 큰 가중치 (역거리 가중치)
+            # +0.3은 lookahead 정확히 위에 있는 bin이 무한대 가중을 받지 않도록 하는 ε
+            weights = 1.0 / (np.abs(arr[:, 0] - self.LOOKAHEAD_X) + 0.3)
+            target_y = float(np.average(arr[:, 1], weights=weights))
 
-            # 왼쪽 라바콘만 보이는 경우
-            if len(left_points) > 0:
-                arr = np.array(
-                    [[p[0], p[1]] for p in left_points],
-                    dtype=np.float32
-                )
+            # target_x는 고정 lookahead — 가까운 페어 때문에 atan2가 과도해지는 것 방지
+            target_x = self.LOOKAHEAD_X
 
-                order = np.argsort(np.abs(arr[:, 0] - self.LOOKAHEAD_X))
-                arr = arr[order]
+            if abs(target_y) < self.LIDAR_TARGET_Y_DEADBAND:
+                target_y = 0.0
 
-                # 실제 왼쪽 라바콘은 y < 0.
-                # 중앙은 y 증가 방향.
-                y = float(arr[0, 1] + self.CONE_LANE_HALF_WIDTH)
+            self._lidar_target_y_history.append(target_y)
+            target_y = float(np.mean(self._lidar_target_y_history))
 
-                # 곡선에서 한쪽 라바콘만 볼 때도 smoothing 적용
-                if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
-                    y = 0.0
-
-                self._lidar_target_y_history.append(y)
-                y = float(np.mean(self._lidar_target_y_history))
-
-                return (
-                    (float(self.LOOKAHEAD_X), y),
-                    "left_only_sparse"
-                )
-
-            # 오른쪽 라바콘만 보이는 경우
-            if len(right_points) > 0:
-                arr = np.array(
-                    [[p[0], p[1]] for p in right_points],
-                    dtype=np.float32
-                )
-
-                order = np.argsort(np.abs(arr[:, 0] - self.LOOKAHEAD_X))
-                arr = arr[order]
-
-                # 실제 오른쪽 라바콘은 y > 0.
-                # 중앙은 y 감소 방향.
-                y = float(arr[0, 1] - self.CONE_LANE_HALF_WIDTH)
-
-                if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
-                    y = 0.0
-
-                self._lidar_target_y_history.append(y)
-                y = float(np.mean(self._lidar_target_y_history))
-
-                return (
-                    (float(self.LOOKAHEAD_X), y),
-                    "right_only_sparse"
-                )
-
-            return None, "no_points"
-
-        #=============================================
-        # 좌우 라바콘이 둘 다 보이는 경우
-        #=============================================
-        def select_side_points(points):
-            arr = np.array(
-                [[p[0], p[1]] for p in points],
-                dtype=np.float32
+            return (
+                (float(target_x), float(target_y)),
+                f"binned_midpoint n={len(midpoints)}"
             )
 
-            # LOOKAHEAD_X 근처 점 우선
-            dist_to_lookahead = np.abs(arr[:, 0] - self.LOOKAHEAD_X)
-            order = np.argsort(dist_to_lookahead)
-            arr = arr[order]
+        #=============================================
+        # 2. 페어링 실패 — 시작 직후라면 직진 fallback
+        #=============================================
+        total_points = len(left_points) + len(right_points)
 
-            # lookahead window 안의 점 사용
-            near = arr[
-                np.abs(arr[:, 0] - self.LOOKAHEAD_X)
-                <= self.LOOKAHEAD_WINDOW
-            ]
+        if (
+            self.ALLOW_START_STRAIGHT_TARGET
+            and not self._seen_both_sides_once
+            and startup_frame_count <= self.START_STRAIGHT_FRAMES
+            and total_points >= self.START_STRAIGHT_MIN_POINTS
+        ):
+            return (
+                (float(self.LOOKAHEAD_X), 0.0),
+                f"startup_straight L{len(left_points)} R{len(right_points)}"
+            )
 
-            # window 안에 아무것도 없으면 LOOKAHEAD_X와 가까운 순서 몇 개 사용
-            if len(near) == 0:
-                near = arr[:min(self.SIDE_SELECT_N, len(arr))]
-            else:
-                near = near[:min(self.SIDE_SELECT_N, len(near))]
+        #=============================================
+        # 3. 페어링 실패 — 단일 side 폴백
+        #    (양쪽 다 있어도 bin이 안 맞으면 점이 많은 쪽 사용)
+        #=============================================
+        if not self.ALLOW_SINGLE_SIDE_PATH:
+            return None, f"need_both_sides L{len(left_points)} R{len(right_points)}"
 
-            sx = float(np.median(near[:, 0]))
-            sy = float(np.median(near[:, 1]))
+        if len(left_points) == 0 and len(right_points) == 0:
+            return None, "no_points"
 
-            return sx, sy, len(near)
+        # 더 풍부한 쪽을 신뢰 (곡선에서는 안쪽 라바콘이 더 많이 잡히는 경향)
+        use_left = len(left_points) >= len(right_points)
 
-        lx, ly, ln = select_side_points(left_points)
-        rx, ry, rn = select_side_points(right_points)
+        if use_left and len(left_points) > 0:
+            y = self._single_side_target_y(left_points, sign=+1.0)
+            src = "left_only_sparse"
+        elif len(right_points) > 0:
+            y = self._single_side_target_y(right_points, sign=-1.0)
+            src = "right_only_sparse"
+        else:
+            return None, "no_points"
 
-        # 좌우가 동시에 한 번이라도 잡히면 startup straight fallback 종료
-        self._seen_both_sides_once = True
+        if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
+            y = 0.0
 
-        width = abs(ry - ly)
-
-        # 폭이 이상한 경우
-        if width < self.CONE_WIDTH_MIN or width > self.CONE_WIDTH_MAX:
-
-            # 시작 초반이면서 아직 좌우가 안정적으로 잡힌 적이 없을 때만 직진 fallback
-            # 위에서 seen_both가 True로 바뀌었으므로 사실상 거의 안 쓰이지만 안전장치로 둠.
-            if (
-                self.ALLOW_START_STRAIGHT_TARGET
-                and not self._seen_both_sides_once
-                and startup_frame_count <= self.START_STRAIGHT_FRAMES
-            ):
-                return (
-                    (float(self.LOOKAHEAD_X), 0.0),
-                    f"startup_straight_bad_width={width:.2f}"
-                )
-
-            return None, f"bad_width={width:.2f}"
-
-        # 좌우 라바콘의 중앙 y
-        target_y = 0.5 * (ly + ry)
-
-        # 중요:
-        # target_x는 실제 라바콘 평균 x가 아니라 고정 lookahead로 둔다.
-        # 가까운 점 하나 때문에 atan2가 과도하게 커지는 것을 막는다.
-        target_x = self.LOOKAHEAD_X
-
-        # 직진 구간 deadband
-        if abs(target_y) < self.LIDAR_TARGET_Y_DEADBAND:
-            target_y = 0.0
-
-        # target_y smoothing
-        self._lidar_target_y_history.append(target_y)
-        target_y = float(np.mean(self._lidar_target_y_history))
+        self._lidar_target_y_history.append(y)
+        y = float(np.mean(self._lidar_target_y_history))
 
         return (
-            (float(target_x), float(target_y)),
-            f"sparse_midpoint L{ln} R{rn}"
+            (float(self.LOOKAHEAD_X), float(y)),
+            src
         )
 
     #=============================================
