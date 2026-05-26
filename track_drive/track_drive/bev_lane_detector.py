@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Bird's-Eye-View 차선 감지기 (Xytron Unity 시뮬레이터).
+
+원본 프레임을 perspective warp 으로 위에서 본 시점(BEV)으로 펴고,
+색상 마스크 + 컬럼 히스토그램으로 차선 x 좌표를 찾는다.
+
+LaneDetector와 동일한 dict 인터페이스를 출력하며, 추가로 near/far band
+offset과 curve offset을 반환해 S자/곡선 구간 선제 조향에 사용한다.
+"""
 
 import argparse
 import time
