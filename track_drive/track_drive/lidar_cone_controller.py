@@ -24,7 +24,7 @@ class LidarConeController:
         # Lidar sparse midpoint cone following settings
         #=============================================
         # 가까운 라바콘도 잡되, 0.12m 같은 차체 반사는 제거
-        self.MIN_CONE_DIST = 0.30
+        self.MIN_CONE_DIST = 0.0
         self.MAX_CONE_DIST = 8.0
 
         # 전방 + 측전방까지 넓게 사용
