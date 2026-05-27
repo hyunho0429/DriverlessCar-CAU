@@ -78,16 +78,20 @@ class LidarConeController:
         # 한쪽만 보일 때 폴백 허용 (곡선에서 흔함)
         self.ALLOW_SINGLE_SIDE_PATH = True
 
-        # 차선 절반폭(half-width) 동적 추정 — 양쪽 페어가 잡힐 때마다 EMA 갱신
+        # 차선 절반폭(half-width) 동적 추정 — 디버그 표시용
         self.LANE_HALF_WIDTH_INIT = 2.2     # 트랙 4.4m 가정
         self.LANE_WIDTH_EMA_ALPHA = 0.15
         self._lane_half_width_est = self.LANE_HALF_WIDTH_INIT
 
-        # Single-side 회피 부스트: 한쪽 라바콘에 가까울수록 반대쪽으로 강하게 꺾기
-        self.SINGLE_SIDE_AVOID_THRESHOLD = 1.5   # 이 거리부터 부스트 시작 [m]
-        self.SINGLE_SIDE_AVOID_MAX_BOOST = 2.0   # 0m 거리 최대 부스트 배수
+        # Single-side 이진 commit: 한쪽만 보이면 target_y를 고정 offset으로 commit
+        # 동시에 mode를 CURVE로 강제해 속도 1.8 m/s로 감속 (물리 회전 반경 확보)
+        self.SINGLE_SIDE_COMMIT_OFFSET = 2.5     # target_y = ±2.5m 고정
 
-        # single-side 폴백에서 사용하는 점 개수
+        # 외톨이 라바콘 폐기 — 비대칭 페어 시 멀리 있는 외톨이 무시
+        self.LONE_CONE_DISCARD_ASYM = 2          # |L-R| >= 이 값
+        self.LONE_CONE_DISCARD_RANGE = 2.5       # 외톨이 range > 이 값이면 폐기
+
+        # 호환성용 (현재 미사용)
         self.SIDE_SELECT_N = 4
 
         #=============================================
@@ -214,6 +218,9 @@ class LidarConeController:
 
         # [3] 좌/우 분리
         left_cones, right_cones = self._split_left_right_cones(cones)
+
+        # [3.5] 외톨이 라바콘 폐기 — 비대칭 + 멀리 있는 외톨이는 노이즈로 간주
+        left_cones, right_cones = self._discard_lone_outlier(left_cones, right_cones)
 
         # [4] x-bin pairing -> midpoints
         midpoints = self._x_binned_midpoints(left_cones, right_cones)
@@ -401,6 +408,34 @@ class LidarConeController:
         return left, right
 
     #=============================================
+    # [3.5] 외톨이 라바콘 폐기
+    #=============================================
+    def _discard_lone_outlier(self, left_cones, right_cones):
+        """비대칭 페어(|L-R| >= ASYM) + 적은 쪽 cone이 모두 멀리(>RANGE)면 폐기.
+        곡선 시작 지점에서 멀리 보이는 1개 라바콘이 잘못된 페어링을 유도하는 것 방지."""
+        diff = abs(len(left_cones) - len(right_cones))
+        if diff < self.LONE_CONE_DISCARD_ASYM:
+            return left_cones, right_cones
+
+        # 적은 쪽 식별
+        if len(left_cones) < len(right_cones) and len(left_cones) >= 1:
+            minor = left_cones
+            side = "left"
+        elif len(right_cones) < len(left_cones) and len(right_cones) >= 1:
+            minor = right_cones
+            side = "right"
+        else:
+            return left_cones, right_cones
+
+        # 적은 쪽 cone 모두 멀리 있으면 폐기
+        if all(c.range > self.LONE_CONE_DISCARD_RANGE for c in minor):
+            if side == "left":
+                return [], right_cones
+            else:
+                return left_cones, []
+        return left_cones, right_cones
+
+    #=============================================
     # [4] x-binned pairing -> midpoints
     #=============================================
     def _x_binned_midpoints(self, left_cones, right_cones):
@@ -520,58 +555,33 @@ class LidarConeController:
         if len(left_cones) == 0 and len(right_cones) == 0:
             return None, "no_cones"
 
+        # 단일 사이드 감지 — 이진 commit + CURVE 모드 강제
+        # 한쪽만 보이면 그 반대 방향으로 SINGLE_SIDE_COMMIT_OFFSET 만큼 commit
+        # 동시에 mode를 CURVE로 강제 전환 → 속도 1.8 m/s로 감속 (물리 회전 반경 확보)
         use_left = len(left_cones) >= len(right_cones)
         if use_left and len(left_cones) > 0:
-            y, closest_r, boost = self._single_side_target_y(
-                left_cones, sign=+1.0
-            )
-            src = (f"left_only_avoid n={len(left_cones)} "
-                   f"r={closest_r:.2f} boost={boost:.2f}")
+            # 왼쪽만 보임 → 오른쪽으로 commit (+y)
+            y = +self.SINGLE_SIDE_COMMIT_OFFSET
+            src = f"left_only_commit n={len(left_cones)}"
         elif len(right_cones) > 0:
-            y, closest_r, boost = self._single_side_target_y(
-                right_cones, sign=-1.0
-            )
-            src = (f"right_only_avoid n={len(right_cones)} "
-                   f"r={closest_r:.2f} boost={boost:.2f}")
+            # 오른쪽만 보임 → 왼쪽으로 commit (-y)
+            y = -self.SINGLE_SIDE_COMMIT_OFFSET
+            src = f"right_only_commit n={len(right_cones)}"
         else:
             return None, "no_cones"
+
+        # 강제 CURVE 모드 + lookahead 갱신 (속도/게인 모두 CURVE 값으로)
+        self._current_mode = "CURVE"
+        # 히스테리시스 후보도 CURVE로 고정해 즉시 복귀 방지
+        self._mode_candidate = "CURVE"
+        self._mode_confirm_count = 0
+        target_x_lookahead = self.LOOKAHEAD_BY_MODE["CURVE"]
 
         if abs(y) < self.LIDAR_TARGET_Y_DEADBAND:
             y = 0.0
         self._lidar_target_y_history.append(y)
         y = float(np.mean(self._lidar_target_y_history))
         return ((float(target_x_lookahead), float(y)), src)
-
-    def _single_side_target_y(self, cones, sign):
-        """한쪽 라바콘만 보일 때:
-        가장 가까운 라바콘을 기준으로 동적 lane half-width 만큼 반대쪽으로 target 설정.
-        가까울수록 부스트를 적용해 회피 강도 ↑.
-
-        sign = +1.0 : 왼쪽만 보임 (target은 오른쪽 = +y 방향)
-        sign = -1.0 : 오른쪽만 보임 (target은 왼쪽 = -y 방향)
-
-        반환: (target_y, closest_range, boost)
-        """
-        arr = np.array(
-            [[c.x, c.y, c.range] for c in cones], dtype=np.float32
-        )
-        # range 기준 가장 가까운 라바콘
-        closest_idx = int(np.argmin(arr[:, 2]))
-        closest_y = float(arr[closest_idx, 1])
-        closest_r = float(arr[closest_idx, 2])
-
-        # 거리 비례 회피 부스트
-        thr = self.SINGLE_SIDE_AVOID_THRESHOLD
-        if closest_r < thr:
-            ratio = max(0.0, 1.0 - closest_r / thr)
-            boost = 1.0 + ratio * (self.SINGLE_SIDE_AVOID_MAX_BOOST - 1.0)
-        else:
-            boost = 1.0
-
-        # 반대쪽 라바콘이 있다고 가정한 위치
-        # = 가까운 라바콘 y 좌표 + 반대 방향 (sign) × half_width × boost
-        target_y = closest_y + sign * self._lane_half_width_est * boost
-        return float(target_y), closest_r, float(boost)
 
     #=============================================
     # [7] 조향각 산출 (모드별 게인)
