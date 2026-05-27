@@ -136,11 +136,13 @@ class LidarConeController:
         #=============================================
         self.LIDAR_TARGET_Y_DEADBAND = 0.03
         self.LIDAR_ANGLE_DEADBAND = 0.0
-        self.LIDAR_MAX_STEER = 60.0
+        # sim은 ±100 범위를 받음 (실측: 명령 ±100이 물리 바퀴 약 ±20°)
+        # 60으로 clip하면 sim이 받을 수 있는 한계의 60%만 쓰는 셈 → 100으로
+        self.LIDAR_MAX_STEER = 100.0
 
         # rate limit: 한 프레임에 최대 변할 수 있는 angle [deg]
-        # 9Hz 기준 35deg/frame = 약 315 deg/s
-        self.max_angle_step_s_curve = 35.0
+        # 9Hz 기준 60 deg/frame = 약 540 deg/s — target 큰 변화에 빠르게 catch-up
+        self.max_angle_step_s_curve = 60.0
 
         # target_y < 0 일 때 차가 반대로 꺾으면 +1.0으로 뒤집기
         self.LIDAR_STEER_SIGN = -1.0
